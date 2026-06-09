@@ -35,9 +35,9 @@ drift-sdk @ git+https://github.com/ondrift/sdk.git#subdirectory=python
 npm i "github:ondrift/sdk#semver:*"
 ```
 ```ruby
-# Ruby (Gemfile) — branch:main (bundler defaults git gems to "master"),
-# glob locates the gemspec in ruby/
-gem "drift-sdk", git: "https://github.com/ondrift/sdk", branch: "main", glob: "ruby/*.gemspec"
+# Ruby (Gemfile) — branch:master is the repo default (and bundler's default
+# for git gems); glob locates the gemspec in ruby/
+gem "drift-sdk", git: "https://github.com/ondrift/sdk", branch: "master", glob: "ruby/*.gemspec"
 ```
 ```bash
 # PHP — VCS repo + the "*" constraint tracks the latest tag
