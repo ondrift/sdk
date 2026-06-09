@@ -1,8 +1,7 @@
 Gem::Specification.new do |spec|
   spec.name          = "drift-sdk"
-  spec.version       = "1.0.0"
+  spec.version       = "1.0.2"
   spec.authors       = ["Drift"]
-  spec.email         = ["hello@ondrift.eu"]
 
   spec.summary       = "Drift SDK for Ruby Atomic functions"
   spec.description   = "Single-file, zero-dependency Ruby SDK for writing Drift Atomic functions."
