@@ -1,0 +1,32 @@
+{
+  "name": "@ondrift/sdk",
+  "version": "1.0.0",
+  "description": "Drift SDK for Node.js.",
+  "main": "node/index.js",
+  "type": "commonjs",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "drift",
+    "serverless",
+    "atomic",
+    "sdk"
+  ],
+  "author": "Drift",
+  "homepage": "https://ondrift.eu",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ondrift/sdk.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ondrift/sdk/issues"
+  },
+  "files": [
+    "node/index.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "dependencies": {}
+}

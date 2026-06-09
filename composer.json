@@ -1,0 +1,23 @@
+{
+    "name": "ondrift/sdk",
+    "description": "Drift SDK for PHP Atomic functions — single-file, built-in functions only.",
+    "type": "library",
+    "license": "MIT",
+    "homepage": "https://ondrift.eu",
+    "authors": [
+        {
+            "name": "Drift"
+        }
+    ],
+    "support": {
+        "issues": "https://github.com/ondrift/sdk/issues",
+        "source": "https://github.com/ondrift/sdk"
+    },
+    "keywords": ["drift", "serverless", "atomic", "sdk"],
+    "require": {
+        "php": ">=8.1"
+    },
+    "autoload": {
+        "files": ["php/drift.php"]
+    }
+}

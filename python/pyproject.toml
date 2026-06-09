@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "drift-sdk"
+version = "1.0.0"
+description = "Drift SDK for Python Atomic functions — single-file, stdlib only."
+requires-python = ">=3.9"
+license = { text = "MIT" }
+keywords = ["drift", "serverless", "atomic", "sdk"]
+authors = [
+    { name = "Drift", email = "hello@ondrift.eu" },
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "License :: OSI Approved :: MIT License",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Internet :: WWW/HTTP",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://ondrift.eu"
+Repository = "https://github.com/ondrift/sdk"
+Documentation = "https://ondrift.eu/docs"
+
+[tool.setuptools]
+py-modules = ["drift"]

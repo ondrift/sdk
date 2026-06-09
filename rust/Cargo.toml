@@ -1,0 +1,32 @@
+[package]
+name = "drift-sdk"
+version = "1.0.0"
+edition = "2021"
+description = "Drift SDK for Rust Atomic functions — minimal dependency footprint."
+license = "MIT"
+repository = "https://github.com/ondrift/sdk"
+homepage = "https://ondrift.eu"
+documentation = "https://ondrift.eu/docs"
+authors = ["Drift <hello@ondrift.eu>"]
+keywords = ["drift", "serverless", "atomic", "sdk"]
+categories = ["web-programming", "api-bindings"]
+readme = "../README.md"
+
+[dependencies]
+# ureq v2 is the maintained line we use today; v3 exists but isn't
+# a drop-in upgrade. Re-evaluate when v3's API stabilises.
+#
+# default-features = false drops ureq's bundled TLS (rustls + ring). ring
+# carries C/assembly, so keeping it on would force every Rust deploy to have
+# a C cross-compiler for the musl target. Without it the SDK is pure Rust and
+# cross-compiles with rustup alone (Rust's bundled rust-lld linker). Outbound
+# HTTPS lives behind the opt-in `tls` feature below.
+ureq = { version = "2", default-features = false }
+serde_json = "1"
+
+[features]
+# Outbound HTTPS from http_request(). Off by default to keep the common case
+# (localhost Backbone + plain HTTP) buildable with just rustup. Turning it on
+# pulls ring (C/asm), so deploys then need a C cross-toolchain — e.g. zig +
+# `cargo install cargo-zigbuild`, or a musl cross-gcc.
+tls = ["ureq/tls"]
