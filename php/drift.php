@@ -112,60 +112,88 @@ function _get_backbone_url(): string {
     return $_backbone_url;
 }
 
-function _call(string $method, string $path, $body = null) {
+// _backbone_http issues a request to the backbone over either a Unix Domain
+// Socket (BACKBONE_URL=unix:///path — the slice default: lower latency, no TCP
+// surface) or TCP (http://host:port, used by `drift atomic run`). Returns
+// [status_code, body]. Stdlib only — stream_socket_client for UDS, the http
+// stream wrapper for TCP.
+function _backbone_http(string $method, string $path, ?string $body, string $content_type): array {
     $base = _get_backbone_url();
-    if ($base === '') {
-        return _call_local($method, $path, $body);
+    if (strpos($base, 'unix://') === 0) {
+        return _backbone_uds(substr($base, strlen('unix://')), $method, "/$path", $body, $content_type);
     }
-
-    $url = "$base/$path";
     // TLS verification is explicit even though Backbone is loopback in
-    // production — keeps the policy uniform with http_request() so an
-    // auditor doesn't have to wonder whether one path is more lax than
-    // another.
+    // production — keeps the policy uniform with http_request().
     $opts = [
         'http' => ['method' => $method, 'ignore_errors' => true],
         'ssl'  => ['verify_peer' => true, 'verify_peer_name' => true],
     ];
-
     if ($body !== null) {
-        $opts['http']['header'] = "Content-Type: application/json\r\n";
-        $opts['http']['content'] = json_encode($body);
+        $opts['http']['header'] = "Content-Type: $content_type\r\n";
+        $opts['http']['content'] = $body;
     }
-
-    $context = stream_context_create($opts);
-    $result = @file_get_contents($url, false, $context);
-
-    if (isset($http_response_header)) {
-        foreach ($http_response_header as $header) {
-            if (preg_match('/^HTTP\/\S+ 204/', $header)) {
-                return null;
-            }
-        }
+    $result = @file_get_contents("$base/$path", false, stream_context_create($opts));
+    $status = 0;
+    if (isset($http_response_header[0]) && preg_match('#^HTTP/\S+\s+(\d+)#', $http_response_header[0], $m)) {
+        $status = (int) $m[1];
     }
+    return [$status, $result === false ? null : $result];
+}
 
-    if ($result === false || $result === '') return null;
+function _backbone_uds(string $sock_path, string $method, string $path, ?string $body, string $content_type): array {
+    $fp = @stream_socket_client("unix://$sock_path", $errno, $errstr, 30);
+    if (!$fp) return [0, null];
+    $req = "$method $path HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n";
+    if ($body !== null) {
+        $req .= "Content-Type: $content_type\r\nContent-Length: " . strlen($body) . "\r\n";
+    }
+    $req .= "\r\n";
+    if ($body !== null) $req .= $body;
+    fwrite($fp, $req);
+    $raw = '';
+    while (!feof($fp)) { $raw .= fread($fp, 8192); }
+    fclose($fp);
+    return _parse_http($raw);
+}
 
+// _parse_http splits a raw HTTP/1.1 response into [status_code, body],
+// decoding Transfer-Encoding: chunked when present (Content-Length otherwise).
+function _parse_http(string $raw): array {
+    $pos = strpos($raw, "\r\n\r\n");
+    if ($pos === false) return [0, null];
+    $lines = explode("\r\n", substr($raw, 0, $pos));
+    $rest = substr($raw, $pos + 4);
+    $status = preg_match('#^HTTP/\S+\s+(\d+)#', $lines[0], $m) ? (int) $m[1] : 0;
+    $chunked = false;
+    foreach ($lines as $l) {
+        if (stripos($l, 'transfer-encoding:') === 0 && stripos($l, 'chunked') !== false) { $chunked = true; break; }
+    }
+    if (!$chunked) return [$status, $rest];
+    $body = '';
+    $buf = $rest;
+    while (true) {
+        $nl = strpos($buf, "\r\n");
+        if ($nl === false) break;
+        $size = hexdec(substr($buf, 0, $nl));
+        if ($size <= 0) break;
+        $body .= substr($buf, $nl + 2, $size);
+        $buf = substr($buf, $nl + 2 + $size + 2);
+    }
+    return [$status, $body];
+}
+
+function _call(string $method, string $path, $body = null) {
+    if (_get_backbone_url() === '') return _call_local($method, $path, $body);
+    [$status, $result] = _backbone_http($method, $path, $body !== null ? json_encode($body) : null, 'application/json');
+    if ($status === 204 || $result === null || $result === '') return null;
     $decoded = json_decode($result, true);
     return ($decoded !== null) ? $decoded : $result;
 }
 
 function _call_raw(string $method, string $path, string $data_bytes, string $content_type = 'application/octet-stream'): ?string {
-    $base = _get_backbone_url();
-    if ($base === '') return null;
-    $url = "$base/$path";
-    $opts = [
-        'http' => [
-            'method'        => $method,
-            'header'        => "Content-Type: $content_type\r\n",
-            'content'       => $data_bytes,
-            'ignore_errors' => true,
-        ],
-        'ssl' => ['verify_peer' => true, 'verify_peer_name' => true],
-    ];
-    $context = stream_context_create($opts);
-    $result = @file_get_contents($url, false, $context);
-    return $result === false ? null : $result;
+    if (_get_backbone_url() === '') return null;
+    [$status, $result] = _backbone_http($method, $path, $data_bytes, $content_type);
+    return ($status >= 200 && $status < 300) ? $result : null;
 }
 
 // In-memory backbone for local dev.
@@ -422,13 +450,10 @@ class Blob {
 
     public static function get(string $name) {
         [$bucket, $key] = _split_bucket_key($name);
+        if (_get_backbone_url() === '') return null;
         $path = 'blob/get?bucket=' . urlencode($bucket) . '&key=' . urlencode($key);
-        $base = _get_backbone_url();
-        if ($base === '') return null;
-        $opts = ['http' => ['method' => 'GET', 'ignore_errors' => true]];
-        $ctx = stream_context_create($opts);
-        $r = @file_get_contents("$base/$path", false, $ctx);
-        return $r === false ? null : $r;
+        [$status, $r] = _backbone_http('GET', $path, null, '');
+        return ($status >= 200 && $status < 300) ? $r : null;
     }
 }
 

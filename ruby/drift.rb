@@ -10,6 +10,7 @@
 
 require 'json'
 require 'net/http'
+require 'socket'
 require 'uri'
 
 # `webrick` and `socket` are required lazily inside the local-dev paths
@@ -100,55 +101,82 @@ module Drift
     @backbone_url ||= ENV['BACKBONE_URL'] || ''
   end
 
-  def self._call(method, path, body = nil)
+  # _backbone_http issues a request to the backbone over either a Unix Domain
+  # Socket (BACKBONE_URL=unix:///path — the slice default: lower latency, no TCP
+  # surface) or TCP (http://host:port, used by `drift atomic run`). Returns
+  # [status_code, body]. Stdlib only — Socket for UDS, Net::HTTP for TCP.
+  def self._backbone_http(method, path, body, content_type)
     base = _get_backbone_url
-    return _call_local(method, path, body) if base.empty?
-
-    uri = URI("#{base}/#{path}")
-    http = Net::HTTP.new(uri.host, uri.port)
-    http.use_ssl = uri.scheme == 'https'
-
-    request = case method
-    when 'GET'    then Net::HTTP::Get.new(uri)
-    when 'POST'   then Net::HTTP::Post.new(uri)
-    when 'PUT'    then Net::HTTP::Put.new(uri)
-    when 'DELETE' then Net::HTTP::Delete.new(uri)
-    else Net::HTTP::Get.new(uri)
+    if base.start_with?('unix://')
+      _backbone_uds(base.sub('unix://', ''), method, "/#{path}", body, content_type)
+    else
+      uri = URI("#{base}/#{path}")
+      http = Net::HTTP.new(uri.host, uri.port)
+      http.use_ssl = uri.scheme == 'https'
+      req = Net::HTTP.const_get(method.capitalize).new(uri)
+      if body
+        req['Content-Type'] = content_type
+        req.body = body
+      end
+      resp = http.request(req)
+      [resp.code.to_i, resp.body]
     end
+  end
 
-    if body
-      request['Content-Type'] = 'application/json'
-      request.body = JSON.generate(body)
-    end
-
-    resp = http.request(request)
-    return nil if resp.code == '204'
-    return nil if resp.body.nil? || resp.body.empty?
-
+  def self._backbone_uds(sock_path, method, path, body, content_type)
+    sock = UNIXSocket.new(sock_path)
     begin
-      JSON.parse(resp.body)
+      out = +"#{method} #{path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n"
+      out << "Content-Type: #{content_type}\r\nContent-Length: #{body.bytesize}\r\n" if body
+      out << "\r\n"
+      out << body if body
+      sock.write(out)
+      raw = sock.read # Connection: close → server closes after the response
+    ensure
+      sock.close
+    end
+    _parse_http(raw || ''.b)
+  end
+
+  # _parse_http splits a raw HTTP/1.1 response into [status_code, body],
+  # decoding Transfer-Encoding: chunked when present (Content-Length otherwise).
+  def self._parse_http(raw)
+    head, _, rest = raw.partition("\r\n\r\n")
+    lines = head.split("\r\n")
+    status = (lines[0].to_s.split(' ')[1] || '0').to_i
+    if lines.any? { |l| d = l.downcase; d.start_with?('transfer-encoding:') && d.include?('chunked') }
+      body = ''.b
+      buf = rest
+      loop do
+        nl = buf.index("\r\n")
+        break unless nl
+        size = buf[0...nl].to_i(16)
+        break if size <= 0
+        start = nl + 2
+        body << buf[start, size].to_s
+        buf = buf[(start + size + 2)..] || ''
+      end
+      [status, body]
+    else
+      [status, rest]
+    end
+  end
+
+  def self._call(method, path, body = nil)
+    return _call_local(method, path, body) if _get_backbone_url.empty?
+    code, resp_body = _backbone_http(method, path, body ? JSON.generate(body) : nil, 'application/json')
+    return nil if code == 204 || resp_body.nil? || resp_body.empty?
+    begin
+      JSON.parse(resp_body)
     rescue JSON::ParserError
-      resp.body
+      resp_body
     end
   end
 
   def self._call_raw(method, path, data_bytes, content_type = 'application/octet-stream')
-    base = _get_backbone_url
-    return nil if base.empty?
-
-    uri = URI("#{base}/#{path}")
-    http = Net::HTTP.new(uri.host, uri.port)
-    http.use_ssl = uri.scheme == 'https'
-
-    request = case method
-    when 'POST' then Net::HTTP::Post.new(uri)
-    when 'PUT'  then Net::HTTP::Put.new(uri)
-    else             Net::HTTP::Post.new(uri)
-    end
-    request['Content-Type'] = content_type
-    request.body = data_bytes
-    resp = http.request(request)
-    resp.is_a?(Net::HTTPSuccess) ? resp.body : nil
+    return nil if _get_backbone_url.empty?
+    code, resp_body = _backbone_http(method, path, data_bytes, content_type)
+    (code && code >= 200 && code < 300) ? resp_body : nil
   end
 
   # In-memory backbone for local dev.
@@ -402,11 +430,10 @@ module Drift
 
     def self.get(name)
       bucket, key = _split(name)
-      base = Drift._get_backbone_url
-      return nil if base.empty?
-      url = URI("#{base}/blob/get?bucket=#{URI.encode_www_form_component(bucket)}&key=#{URI.encode_www_form_component(key)}")
-      resp = Net::HTTP.get_response(url)
-      resp.is_a?(Net::HTTPSuccess) ? resp.body : nil
+      return nil if Drift._get_backbone_url.empty?
+      path = "blob/get?bucket=#{URI.encode_www_form_component(bucket)}&key=#{URI.encode_www_form_component(key)}"
+      code, body = Drift._backbone_http('GET', path, nil, nil)
+      (code && code >= 200 && code < 300) ? body : nil
     end
   end
 
