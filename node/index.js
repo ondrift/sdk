@@ -529,7 +529,7 @@ const jwt = {
  * Entry point for SSE streaming functions.
  *
  * Usage:
- *   // @atomic route=get:events auth=none stream=sse
+ *   // @atomic http=get:events auth=none stream=sse
  *   const drift = require("@drift/sdk");
  *   drift.runSSE(async (req, emit) => {
  *     for (let i = 0; i < 10; i++) {
@@ -624,7 +624,7 @@ function _runLocalSSE(handler) {
  * Entry point for WebSocket functions.
  *
  * Usage:
- *   // @atomic route=get:chat auth=none stream=ws
+ *   // @atomic http=get:chat auth=none stream=ws
  *   const drift = require("@drift/sdk");
  *   drift.runWS(async (req, conn) => {
  *     while (true) {

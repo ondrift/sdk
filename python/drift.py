@@ -587,7 +587,7 @@ def run_sse(handler):
     """Entry point for SSE streaming functions.
 
     Usage:
-        # @atomic route=get:events auth=none stream=sse
+        # @atomic http=get:events auth=none stream=sse
         import drift
 
         def get_events(req, emit):
@@ -779,7 +779,7 @@ def run_ws(handler):
     """Entry point for WebSocket functions.
 
     Usage:
-        # @atomic route=get:chat auth=none stream=ws
+        # @atomic http=get:chat auth=none stream=ws
         import drift
 
         def get_chat(req, conn):

@@ -803,7 +803,7 @@ pub fn http_request_with_timeout(
 /// Entry point for SSE streaming functions.
 ///
 /// ```rust
-/// // @atomic route=get:events auth=none stream=sse
+/// // @atomic http=get:events auth=none stream=sse
 /// drift_sdk::run_sse(|req, emit| {
 ///     for i in 0..10 {
 ///         emit("counter", &serde_json::json!({"value": i}));
@@ -996,7 +996,7 @@ impl WsConn {
 /// Entry point for WebSocket functions.
 ///
 /// ```rust
-/// // @atomic route=get:chat auth=none stream=ws
+/// // @atomic http=get:chat auth=none stream=ws
 /// drift_sdk::run_ws(|req, conn| {
 ///     loop {
 ///         match conn.read() {

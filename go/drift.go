@@ -42,6 +42,14 @@ type Response struct {
 // Run is the entry point for Drift Atomic functions. The handler receives
 // the incoming HTTP request and must return a response.
 //
+// You normally do NOT call Run yourself. The Drift CLI reads the `@atomic`
+// annotation above your exported handler (e.g. `func PostItems(body, req)
+// (int, string, any, map[string]string)`), generates the program's `main()`,
+// and that generated main is what calls Run. Write the annotated handler and
+// let the CLI wire the entry point. (Ruby is the one exception: its file ends
+// with `Drift.run(method(:handler))`.) Call Run directly only if you are
+// hand-building a main without the CLI.
+//
 // In deployed mode (DRIFT_RUNTIME is set): reads a JSON request from stdin,
 // calls the handler, and writes the JSON response to stdout. The runner
 // manages the HTTP routing, log capture, and metrics.
@@ -408,6 +416,17 @@ func callBackboneHTTP(baseURL, method, path string, body any) ([]byte, error) {
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("drift: read backbone response: %w", err)
+	}
+	// A non-2xx response body is an ERROR, not data. Without this check a
+	// 401/404/500 body (e.g. an unauthorized secret read) is returned to the
+	// caller as if it were the value — so a guard like `if v != ""` passes
+	// with the error text. Return an error so callers fail loudly instead.
+	if resp.StatusCode >= 400 {
+		msg := strings.TrimSpace(string(data))
+		if msg == "" {
+			msg = http.StatusText(resp.StatusCode)
+		}
+		return nil, fmt.Errorf("drift: backbone %s: HTTP %d: %s", path, resp.StatusCode, msg)
 	}
 	if resp.StatusCode == http.StatusNoContent || len(data) == 0 {
 		return nil, nil
@@ -847,7 +866,7 @@ func wrapEgressDenied(rawURL string, err error) *EgressDeniedError {
 //
 // Usage:
 //
-//	// @atomic route=get:events auth=none stream=sse
+//	// @atomic http=get:events auth=none stream=sse
 //	func main() {
 //	    drift.RunSSE(func(req drift.Request, emit drift.Emitter) {
 //	        for i := 0; i < 10; i++ {
@@ -956,7 +975,7 @@ func (e Emitter) SendRaw(event, data string) {
 //
 // Usage:
 //
-//	// @atomic route=get:chat auth=none stream=ws
+//	// @atomic http=get:chat auth=none stream=ws
 //	func main() {
 //	    drift.RunWS(func(req drift.Request, conn drift.Conn) {
 //	        for {
