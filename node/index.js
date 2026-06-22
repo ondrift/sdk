@@ -75,8 +75,7 @@ function _runLocal(handler) {
     }
 
     const funcReq = {
-      method: req.method,
-      path: url.pathname,
+      path:url.pathname,
       headers,
       query: url.search ? url.search.slice(1) : "",
       body: parsed,
@@ -586,8 +585,7 @@ function _runLocalSSE(handler) {
     });
 
     const funcReq = {
-      method: req.method,
-      path: url.pathname,
+      path:url.pathname,
       headers,
       query: url.search ? url.search.slice(1) : "",
       body: parsed,

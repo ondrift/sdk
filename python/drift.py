@@ -86,8 +86,7 @@ def _run_local(handler):
             headers = {k: self.headers[k] for k in self.headers}
 
             req = {
-                "method": self.command,
-                "path": parsed.path,
+                "path":parsed.path,
                 "headers": headers,
                 "query": parsed.query,
                 "body": body,
@@ -625,8 +624,7 @@ def run_sse(handler):
                     body = raw.decode("utf-8", errors="replace")
             parsed = urllib.parse.urlparse(self.path)
             req = {
-                "method": self.command,
-                "path": parsed.path,
+                "path":parsed.path,
                 "headers": {k: self.headers[k] for k in self.headers},
                 "query": parsed.query,
                 "body": body,

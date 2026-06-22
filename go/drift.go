@@ -21,7 +21,9 @@ import (
 // The runner serializes the original HTTP request into this struct
 // and writes it to the subprocess's stdin as JSON.
 type Request struct {
-	Method       string            `json:"method"`
+	// The HTTP method is intentionally absent: a function is addressed by
+	// method+path and was routed here AS the (e.g.) POST handler, so there's
+	// nothing to branch on. An off-method request 404s; it never arrives here.
 	Path         string            `json:"path"`
 	Headers      map[string]string `json:"headers"`
 	Query        string            `json:"query"`
@@ -102,7 +104,6 @@ func runLocal(handler func(Request) Response) {
 		}
 
 		req := Request{
-			Method:  r.Method,
 			Path:    r.URL.Path,
 			Headers: headers,
 			Query:   r.URL.RawQuery,
@@ -908,7 +909,6 @@ func runLocalSSE(handler func(Request, Emitter)) {
 			headers[k] = r.Header.Get(k)
 		}
 		req := Request{
-			Method:  r.Method,
 			Path:    r.URL.Path,
 			Headers: headers,
 			Query:   r.URL.RawQuery,

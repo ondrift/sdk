@@ -97,7 +97,7 @@ fn run_local<F: Fn(Value) -> Value + 'static>(handler: F) {
         if parts.len() < 2 {
             continue;
         }
-        let method = parts[0];
+        let _ = parts[0]; // method is no longer surfaced to handlers
         let path_str = parts[1];
 
         // Read headers.
@@ -140,7 +140,6 @@ fn run_local<F: Fn(Value) -> Value + 'static>(handler: F) {
         };
 
         let req = serde_json::json!({
-            "method": method,
             "path": path,
             "headers": Value::Object(headers),
             "query": query,
@@ -880,7 +879,7 @@ where
         if parts.len() < 2 {
             continue;
         }
-        let method = parts[0].to_string();
+        let _ = &parts[0]; // method is no longer surfaced to handlers
         let path_str = parts[1].to_string();
 
         let mut headers = serde_json::Map::new();
@@ -920,7 +919,6 @@ where
         };
 
         let req = serde_json::json!({
-            "method": method,
             "path": path,
             "headers": Value::Object(headers),
             "query": query,

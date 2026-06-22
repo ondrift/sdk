@@ -71,7 +71,6 @@ module Drift
       end
 
       req = {
-        'method' => http_req.request_method,
         'path' => http_req.path,
         'headers' => headers,
         'query' => http_req.query_string || '',
@@ -583,7 +582,7 @@ module Drift
         begin
           request_line = s.gets
           next unless request_line
-          method, path_query, _ = request_line.split(' ', 3)
+          _, path_query, _ = request_line.split(' ', 3)
           path, query = (path_query || '/').split('?', 2)
 
           headers = {}
@@ -604,7 +603,6 @@ module Drift
           end
 
           req = {
-            'method' => method,
             'path' => path,
             'headers' => headers,
             'query' => query || '',

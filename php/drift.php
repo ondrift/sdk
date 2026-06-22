@@ -72,7 +72,6 @@ function _run_local(callable $handler): void {
 
             $parsed = parse_url($path_str);
             $req = [
-                'method' => $method,
                 'path' => $parsed['path'] ?? '/',
                 'headers' => $headers,
                 'query' => $parsed['query'] ?? '',
@@ -651,7 +650,6 @@ function _run_local_sse(callable $handler): void {
 
             $parsed = parse_url($path_str);
             $req = [
-                'method' => $method,
                 'path' => $parsed['path'] ?? '/',
                 'headers' => $headers,
                 'query' => $parsed['query'] ?? '',
