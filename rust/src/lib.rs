@@ -2,9 +2,15 @@
 //!
 //! Provides:
 //!   - run(handler): Entry point (deployed or local mode).
-//!   - Backbone helpers: secret, cache, nosql, queue, blob, lock.
+//!   - `backbone` — the B of the sacred A·B·C triad; the SOLE entrypoint for
+//!     every STATE primitive: `backbone::secret`, `backbone::cache`,
+//!     `backbone::nosql`, `backbone::queue`, `backbone::blob`, `backbone::lock`,
+//!     `backbone::jwt`, `backbone::sql`, `backbone::realtime`,
+//!     `backbone::keyauth`, `backbone::vault`. (There is no top-level
+//!     `drift_sdk::secret` etc. — go through `drift_sdk::backbone`.)
 //!   - log(msg): Writes to stderr (captured by runner).
 //!   - http_request(): Outbound HTTP from within a function.
+//!   - slice(name) / caller_slice(req): slice-to-slice linking.
 
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -410,311 +416,535 @@ fn call_local(_method: &str, path: &str, body: Option<Value>) -> Option<Value> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Secret
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// Backbone — the B of the sacred A·B·C triad. The SOLE entrypoint for every
+// state primitive. Reach these as `backbone::secret::get(...)`,
+// `backbone::queue(...)`, `backbone::realtime::channel(...)`, etc. Nothing
+// stateful lives at the crate root.
+//
+// Sub-modules glob-import the crate root (`use crate::*`) for the private
+// transport helpers (`call`, `percent_encode`, …) and `Value` — exactly the
+// target the modules used before they were nested under `backbone`.
+// ===========================================================================
 
-pub mod secret {
-    use super::*;
+pub mod backbone {
+    use crate::*;
 
-    /// Read order:
-    ///   1. `DRIFT_SECRET_<NAME>` env var — set by the runner from the
-    ///      function's `@atomic-secrets` allowlist. Only path that works
-    ///      in production: backbone `/secret/get` is SAT-guarded and the
-    ///      subprocess does not hold the SAT.
-    ///   2. HTTP fallback — local-dev only. In production, returns 401.
-    pub fn get(name: &str) -> String {
-        let env_key = format!("DRIFT_SECRET_{}", name.to_uppercase());
-        if let Ok(v) = std::env::var(&env_key) {
-            return v;
+    // -----------------------------------------------------------------------
+    // Secret
+    // -----------------------------------------------------------------------
+
+    pub mod secret {
+        use crate::*;
+
+        /// Read order:
+        ///   1. `DRIFT_SECRET_<NAME>` env var — set by the runner from the
+        ///      function's `@atomic-secrets` allowlist. Only path that works
+        ///      in production: backbone `/secret/get` is SAT-guarded and the
+        ///      subprocess does not hold the SAT.
+        ///   2. HTTP fallback — local-dev only. In production, returns 401.
+        pub fn get(name: &str) -> String {
+            let env_key = format!("DRIFT_SECRET_{}", name.to_uppercase());
+            if let Ok(v) = std::env::var(&env_key) {
+                return v;
+            }
+            match call("GET", &format!("secret/get?name={}", percent_encode(name)), None) {
+                Some(Value::String(s)) => s,
+                Some(v) => serde_json::to_string(&v).unwrap_or_default(),
+                None => String::new(),
+            }
         }
-        match call("GET", &format!("secret/get?name={}", percent_encode(name)), None) {
-            Some(Value::String(s)) => s,
-            Some(v) => serde_json::to_string(&v).unwrap_or_default(),
-            None => String::new(),
+
+        pub fn set(name: &str, value: &str) {
+            call("POST", "secret/set", Some(serde_json::json!({"name": name, "value": value})));
+        }
+
+        pub fn delete(name: &str) {
+            call("DELETE", &format!("secret/delete?name={}", percent_encode(name)), None);
         }
     }
 
-    pub fn set(name: &str, value: &str) {
-        call("POST", "secret/set", Some(serde_json::json!({"name": name, "value": value})));
-    }
+    // -----------------------------------------------------------------------
+    // Cache
+    // -----------------------------------------------------------------------
 
-    pub fn delete(name: &str) {
-        call("DELETE", &format!("secret/delete?name={}", percent_encode(name)), None);
-    }
-}
+    pub mod cache {
+        use crate::*;
 
-// ---------------------------------------------------------------------------
-// Cache
-// ---------------------------------------------------------------------------
-
-pub mod cache {
-    use super::*;
-
-    pub fn get(key: &str) -> Option<Value> {
-        call("GET", &format!("cache/get?key={}", percent_encode(key)), None)
-    }
-
-    pub fn set(key: &str, value: Value, ttl: u64) {
-        let mut payload = serde_json::json!({"key": key, "value": value});
-        if ttl > 0 {
-            payload["ttl"] = Value::from(ttl);
+        pub fn get(key: &str) -> Option<Value> {
+            call("GET", &format!("cache/get?key={}", percent_encode(key)), None)
         }
-        call("POST", "cache/set", Some(payload));
+
+        pub fn set(key: &str, value: Value, ttl: u64) {
+            let mut payload = serde_json::json!({"key": key, "value": value});
+            if ttl > 0 {
+                payload["ttl"] = Value::from(ttl);
+            }
+            call("POST", "cache/set", Some(payload));
+        }
+
+        pub fn delete(key: &str) {
+            call("DELETE", &format!("cache/del?key={}", percent_encode(key)), None);
+        }
     }
 
-    pub fn delete(key: &str) {
-        call("DELETE", &format!("cache/del?key={}", percent_encode(key)), None);
+    // -----------------------------------------------------------------------
+    // NoSQL
+    // -----------------------------------------------------------------------
+
+    pub mod nosql {
+        use crate::*;
+
+        pub struct Collection {
+            name: String,
+        }
+
+        pub fn collection(name: &str) -> Collection {
+            Collection { name: name.to_string() }
+        }
+
+        impl Collection {
+            pub fn insert(&self, doc: Value) -> String {
+                let mut payload = serde_json::json!({"collection": self.name});
+                if let Value::Object(map) = doc {
+                    for (k, v) in map {
+                        payload[&k] = v;
+                    }
+                } else {
+                    payload["data"] = doc;
+                }
+                match call("POST", "write", Some(payload)) {
+                    Some(Value::Object(m)) => {
+                        m.get("key").and_then(|v| v.as_str()).unwrap_or("").to_string()
+                    }
+                    _ => String::new(),
+                }
+            }
+
+            pub fn read(&self, key: &str) -> Option<Value> {
+                call("GET", &format!("read?collection={}&key={}", percent_encode(&self.name), percent_encode(key)), None)
+            }
+
+            pub fn get(&self, id: &str) -> Option<Value> {
+                let path = format!(
+                    "nosql/list?collection={}&field=_id&value={}",
+                    percent_encode(&self.name),
+                    percent_encode(id),
+                );
+                match call("GET", &path, None) {
+                    Some(Value::Array(arr)) if !arr.is_empty() => Some(arr[0].clone()),
+                    _ => None,
+                }
+            }
+
+            pub fn delete(&self, key: &str) {
+                call("POST", &format!(
+                    "nosql/delete?collection={}&key={}",
+                    percent_encode(&self.name),
+                    percent_encode(key),
+                ), None);
+            }
+
+            pub fn list(&self, filter: Option<HashMap<String, String>>) -> Vec<Value> {
+                let mut path = format!("nosql/list?collection={}", percent_encode(&self.name));
+                if let Some(f) = filter {
+                    for (k, v) in f {
+                        path.push_str(&format!("&field={}&value={}", percent_encode(&k), percent_encode(&v)));
+                    }
+                }
+                match call("GET", &path, None) {
+                    Some(Value::Array(arr)) => arr,
+                    _ => vec![],
+                }
+            }
+
+            pub fn drop(&self) {
+                call("POST", &format!("nosql/drop?collection={}", percent_encode(&self.name)), None);
+            }
+        }
     }
-}
 
-// ---------------------------------------------------------------------------
-// NoSQL
-// ---------------------------------------------------------------------------
+    // -----------------------------------------------------------------------
+    // Queue
+    // -----------------------------------------------------------------------
 
-pub mod nosql {
-    use super::*;
-
-    pub struct Collection {
+    pub struct QueueHandle {
         name: String,
     }
 
-    pub fn collection(name: &str) -> Collection {
-        Collection { name: name.to_string() }
+    pub fn queue(name: &str) -> QueueHandle {
+        QueueHandle { name: name.to_string() }
     }
 
-    impl Collection {
-        pub fn insert(&self, doc: Value) -> String {
-            let mut payload = serde_json::json!({"collection": self.name});
-            if let Value::Object(map) = doc {
-                for (k, v) in map {
-                    payload[&k] = v;
-                }
-            } else {
-                payload["data"] = doc;
+    impl QueueHandle {
+        pub fn push(&self, body: Value) {
+            call("POST", "queue/push", Some(serde_json::json!({"queue": self.name, "body": body})));
+        }
+
+        pub fn pop(&self) -> Option<Value> {
+            call("POST", "queue/pop", Some(serde_json::json!({"queue": self.name})))
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Blob
+    // -----------------------------------------------------------------------
+
+    pub mod blob {
+        use crate::*;
+
+        fn split_bucket_key(name: &str) -> (&str, &str) {
+            match name.split_once('/') {
+                Some((b, k)) => (b, k),
+                None => ("default", name),
             }
-            match call("POST", "write", Some(payload)) {
+        }
+
+        pub fn put(name: &str, data: &[u8], content_type: Option<&str>) {
+            let (bucket, key) = split_bucket_key(name);
+            let path = format!("blob/put?bucket={}&key={}", percent_encode(bucket), percent_encode(key));
+            call_raw("POST", &path, data, content_type.unwrap_or("application/octet-stream"));
+        }
+
+        pub fn get(name: &str) -> Option<Vec<u8>> {
+            let (bucket, key) = split_bucket_key(name);
+            let path = format!("blob/get?bucket={}&key={}", percent_encode(bucket), percent_encode(key));
+            let base = get_backbone_url();
+            if base.is_empty() { return None; }
+            let url = format!("{}/{}", base, path);
+            match ureq::get(&url).call() {
+                Ok(r) => {
+                    let mut buf = Vec::new();
+                    let _ = r.into_reader().read_to_end(&mut buf);
+                    Some(buf)
+                }
+                Err(_) => None,
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Lock
+    // -----------------------------------------------------------------------
+
+    pub mod lock {
+        use crate::*;
+
+        pub fn acquire(name: &str, ttl: u64) -> String {
+            match call("POST", "lock/acquire", Some(serde_json::json!({"name": name, "ttl": ttl}))) {
                 Some(Value::Object(m)) => {
-                    m.get("key").and_then(|v| v.as_str()).unwrap_or("").to_string()
+                    m.get("token").and_then(|v| v.as_str()).unwrap_or("").to_string()
                 }
                 _ => String::new(),
             }
         }
 
-        pub fn read(&self, key: &str) -> Option<Value> {
-            call("GET", &format!("read?collection={}&key={}", percent_encode(&self.name), percent_encode(key)), None)
+        pub fn release(name: &str, token: &str) {
+            call("POST", "lock/release", Some(serde_json::json!({"name": name, "token": token})));
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // JWT primitive
+    // -----------------------------------------------------------------------
+    //
+    // HS256 minting + verification, signed with the slice's per-slice JKey. The
+    // signing key never leaves the slice's backbone process; all operations flow
+    // through loopback HTTP to backbone /jwt/{sign,verify,slice-id}.
+    //
+    // Design: internal/todo/slice-jwt-primitive.md.
+
+    pub mod jwt {
+        use crate::*;
+
+        /// Returned by [`verify`] when the token fails validation. `reason`
+        /// is one of the stable wire strings: `malformed`, `bad_signature`,
+        /// `expired`, `not_yet_valid`, `wrong_algorithm`, `wrong_issuer`,
+        /// `wrong_audience`, `invalid_claims`, `missing_exp`, `internal_error`.
+        #[derive(Debug, Clone)]
+        pub struct JWTError {
+            pub reason: String,
         }
 
-        pub fn get(&self, id: &str) -> Option<Value> {
-            let path = format!(
-                "nosql/list?collection={}&field=_id&value={}",
-                percent_encode(&self.name),
-                percent_encode(id),
-            );
-            match call("GET", &path, None) {
-                Some(Value::Array(arr)) if !arr.is_empty() => Some(arr[0].clone()),
-                _ => None,
+        impl std::fmt::Display for JWTError {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "jwt verify: {}", self.reason)
+            }
+        }
+        impl std::error::Error for JWTError {}
+
+        /// Claims payload. Matches the wire shape of the platform JWT
+        /// primitive — standard fields plus an open `custom` map.
+        #[derive(Debug, Clone, Default)]
+        pub struct Claims {
+            pub sub: Option<String>,
+            pub iat: Option<i64>,
+            pub exp: Option<i64>,
+            pub nbf: Option<i64>,
+            pub iss: Option<String>,
+            pub aud: Option<Vec<String>>,
+            pub jti: Option<String>,
+            pub custom: Option<Value>,
+        }
+
+        /// Sign a JWT with the slice's HS256 JKey. `exp` is required;
+        /// `iat`, `iss`, and `jti` are auto-set when `None`.
+        pub fn issue(claims: Claims) -> String {
+            let mut body = serde_json::Map::new();
+            if let Some(v) = claims.sub    { body.insert("sub".to_string(),    Value::String(v)); }
+            if let Some(v) = claims.iat    { body.insert("iat".to_string(),    Value::from(v)); }
+            if let Some(v) = claims.exp    { body.insert("exp".to_string(),    Value::from(v)); }
+            if let Some(v) = claims.nbf    { body.insert("nbf".to_string(),    Value::from(v)); }
+            if let Some(v) = claims.iss    { body.insert("iss".to_string(),    Value::String(v)); }
+            if let Some(v) = claims.aud    { body.insert("aud".to_string(),    serde_json::to_value(v).unwrap_or(Value::Null)); }
+            if let Some(v) = claims.jti    { body.insert("jti".to_string(),    Value::String(v)); }
+            if let Some(v) = claims.custom { body.insert("custom".to_string(), v); }
+
+            match call("POST", "jwt/sign", Some(Value::Object(body))) {
+                Some(Value::Object(m)) => {
+                    m.get("token").and_then(|v| v.as_str()).unwrap_or_default().to_string()
+                }
+                _ => String::new(),
             }
         }
 
-        pub fn delete(&self, key: &str) {
-            call("POST", &format!(
-                "nosql/delete?collection={}&key={}",
-                percent_encode(&self.name),
-                percent_encode(key),
-            ), None);
+        /// Validate a token. Returns parsed claims on success; `JWTError`
+        /// on validation failure.
+        pub fn verify(token: &str, audience: Option<&str>, allowed_issuer: Option<&str>) -> Result<Value, JWTError> {
+            let mut body = serde_json::Map::new();
+            body.insert("token".to_string(), Value::String(token.to_string()));
+            if let Some(a) = audience { body.insert("audience".to_string(), Value::String(a.to_string())); }
+            if let Some(i) = allowed_issuer { body.insert("allowed_issuer".to_string(), Value::String(i.to_string())); }
+
+            let resp = match call("POST", "jwt/verify", Some(Value::Object(body))) {
+                Some(Value::Object(m)) => m,
+                _ => return Err(JWTError { reason: "internal_error".to_string() }),
+            };
+            let valid = resp.get("valid").and_then(|v| v.as_bool()).unwrap_or(false);
+            if !valid {
+                let reason = resp.get("reason").and_then(|v| v.as_str()).unwrap_or("internal_error").to_string();
+                return Err(JWTError { reason });
+            }
+            Ok(resp.get("claims").cloned().unwrap_or(Value::Null))
         }
 
-        pub fn list(&self, filter: Option<HashMap<String, String>>) -> Vec<Value> {
-            let mut path = format!("nosql/list?collection={}", percent_encode(&self.name));
-            if let Some(f) = filter {
-                for (k, v) in f {
-                    path.push_str(&format!("&field={}&value={}", percent_encode(&k), percent_encode(&v)));
+        /// The slice's auto-set issuer string ("drift-slice-<user>-<slice>").
+        pub fn slice_id() -> String {
+            match call("GET", "jwt/slice-id", None) {
+                Some(Value::Object(m)) => {
+                    m.get("slice_id").and_then(|v| v.as_str()).unwrap_or_default().to_string()
+                }
+                _ => String::new(),
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Realtime — pub/sub fan-out over the slice's Canvas WebSocket hub.
+    // -----------------------------------------------------------------------
+    //
+    // Subscribers connect over WebSocket at the Canvas route /realtime/<name>;
+    // publish fans a message out to every connected subscriber.
+
+    pub mod realtime {
+        use crate::*;
+
+        pub struct Channel {
+            name: String,
+        }
+
+        pub fn channel(name: &str) -> Channel {
+            Channel { name: name.to_string() }
+        }
+
+        impl Channel {
+            /// Publish a message to every subscriber. Returns the recipient count.
+            pub fn publish(&self, message: Value) -> u64 {
+                match call("POST", "realtime/publish", Some(serde_json::json!({"channel": self.name, "message": message}))) {
+                    Some(Value::Object(m)) => m.get("recipients").and_then(|v| v.as_u64()).unwrap_or(0),
+                    _ => 0,
                 }
             }
-            match call("GET", &path, None) {
-                Some(Value::Array(arr)) => arr,
-                _ => vec![],
+
+            /// The number of subscribers currently connected to this channel.
+            pub fn presence(&self) -> u64 {
+                match call("GET", &format!("realtime/presence?channel={}", percent_encode(&self.name)), None) {
+                    Some(Value::Object(m)) => m.get("present").and_then(|v| v.as_u64()).unwrap_or(0),
+                    _ => 0,
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // KeyAuth — passwordless Ed25519 device-key auth.
+    // -----------------------------------------------------------------------
+    //
+    // uid = the public key. `challenge` mints a one-time nonce; the client signs
+    // the canonical {domain,nonce,pubkey}; `verify` checks the signature and
+    // returns THIS slice's session JWT. `domain` namespaces the signature per
+    // app (replay-safety).
+
+    pub mod keyauth {
+        use crate::*;
+
+        pub fn challenge(pubkey: &str) -> String {
+            match call("POST", "keyauth/challenge", Some(serde_json::json!({"pubkey": pubkey}))) {
+                Some(Value::Object(m)) => m.get("nonce").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                _ => String::new(),
             }
         }
 
-        pub fn drop(&self) {
-            call("POST", &format!("nosql/drop?collection={}", percent_encode(&self.name)), None);
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Queue
-// ---------------------------------------------------------------------------
-
-pub struct QueueHandle {
-    name: String,
-}
-
-pub fn queue(name: &str) -> QueueHandle {
-    QueueHandle { name: name.to_string() }
-}
-
-impl QueueHandle {
-    pub fn push(&self, body: Value) {
-        call("POST", "queue/push", Some(serde_json::json!({"queue": self.name, "body": body})));
-    }
-
-    pub fn pop(&self) -> Option<Value> {
-        call("POST", "queue/pop", Some(serde_json::json!({"queue": self.name})))
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Blob
-// ---------------------------------------------------------------------------
-
-pub mod blob {
-    use super::*;
-
-    fn split_bucket_key(name: &str) -> (&str, &str) {
-        match name.split_once('/') {
-            Some((b, k)) => (b, k),
-            None => ("default", name),
-        }
-    }
-
-    pub fn put(name: &str, data: &[u8], content_type: Option<&str>) {
-        let (bucket, key) = split_bucket_key(name);
-        let path = format!("blob/put?bucket={}&key={}", percent_encode(bucket), percent_encode(key));
-        call_raw("POST", &path, data, content_type.unwrap_or("application/octet-stream"));
-    }
-
-    pub fn get(name: &str) -> Option<Vec<u8>> {
-        let (bucket, key) = split_bucket_key(name);
-        let path = format!("blob/get?bucket={}&key={}", percent_encode(bucket), percent_encode(key));
-        let base = get_backbone_url();
-        if base.is_empty() { return None; }
-        let url = format!("{}/{}", base, path);
-        match ureq::get(&url).call() {
-            Ok(r) => {
-                let mut buf = Vec::new();
-                let _ = r.into_reader().read_to_end(&mut buf);
-                Some(buf)
+        pub fn verify(pubkey: &str, sig: &str, domain: &str) -> String {
+            match call("POST", "keyauth/verify", Some(serde_json::json!({"pubkey": pubkey, "sig": sig, "domain": domain}))) {
+                Some(Value::Object(m)) => m.get("token").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                _ => String::new(),
             }
-            Err(_) => None,
         }
     }
-}
 
-// ---------------------------------------------------------------------------
-// Lock
-// ---------------------------------------------------------------------------
+    // -----------------------------------------------------------------------
+    // Vault — zero-knowledge recovery store (Layer B).
+    // -----------------------------------------------------------------------
+    //
+    // User-scoped, append-only, opaque. The client encrypts the blob under a key
+    // the slice never sees. Backed by the `keyvault` NoSQL collection (declare
+    // it in your Driftfile).
 
-pub mod lock {
-    use super::*;
+    pub mod vault {
+        use crate::*;
 
-    pub fn acquire(name: &str, ttl: u64) -> String {
-        match call("POST", "lock/acquire", Some(serde_json::json!({"name": name, "ttl": ttl}))) {
-            Some(Value::Object(m)) => {
-                m.get("token").and_then(|v| v.as_str()).unwrap_or("").to_string()
+        pub fn put(uid: &str, blob: &str) {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
+            let nanos = now.as_ref().map(|d| d.as_nanos()).unwrap_or(0);
+            let updated_at = now.as_ref().map(|d| d.as_secs()).unwrap_or(0);
+            super::nosql::collection("keyvault").insert(serde_json::json!({
+                "_id": format!("{}:{}", uid, nanos),
+                "user_id": uid,
+                "blob": blob,
+                "updated_at": updated_at,
+            }));
+        }
+
+        pub fn get(uid: &str) -> Option<Value> {
+            let mut filter = HashMap::new();
+            filter.insert("user_id".to_string(), uid.to_string());
+            let rows = super::nosql::collection("keyvault").list(Some(filter));
+            let mut best_at: i64 = -1;
+            let mut best: Option<Value> = None;
+            for r in rows {
+                let at = r.get("updated_at").and_then(|v| v.as_i64()).unwrap_or(0);
+                if at >= best_at {
+                    best_at = at;
+                    best = r.get("blob").cloned();
+                }
             }
-            _ => String::new(),
+            best
         }
     }
 
-    pub fn release(name: &str, token: &str) {
-        call("POST", "lock/release", Some(serde_json::json!({"name": name, "token": token})));
-    }
-}
+    // ─── SQL ──────────────────────────────────────────────────────────────
+    //
+    // Per-slice SQLite databases addressed by name. Wire shape: one JSON
+    // envelope per call ({db, sql, args, tx?}). See docs/memos/backbone-sql.md.
+    //
+    //   let db = drift_sdk::backbone::sql("clinic");
+    //   let rows = db.query("SELECT * FROM appointments WHERE slot >= ?", &[json!("2026-05-01")]);
+    //   let res = db.execute("INSERT INTO appointments(...) VALUES(?, ?)", &[json!("alice"), json!("10:00")]);
 
-// ---------------------------------------------------------------------------
-// JWT primitive
-// ---------------------------------------------------------------------------
-//
-// HS256 minting + verification, signed with the slice's per-slice JKey. The
-// signing key never leaves the slice's backbone process; all operations flow
-// through loopback HTTP to backbone /jwt/{sign,verify,slice-id}.
-//
-// Design: internal/todo/slice-jwt-primitive.md.
-
-pub mod jwt {
-    use super::*;
-
-    /// Returned by [`verify`] when the token fails validation. `reason`
-    /// is one of the stable wire strings: `malformed`, `bad_signature`,
-    /// `expired`, `not_yet_valid`, `wrong_algorithm`, `wrong_issuer`,
-    /// `wrong_audience`, `invalid_claims`, `missing_exp`, `internal_error`.
-    #[derive(Debug, Clone)]
-    pub struct JWTError {
-        pub reason: String,
+    pub struct SqlDb {
+        name: String,
     }
 
-    impl std::fmt::Display for JWTError {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "jwt verify: {}", self.reason)
-        }
-    }
-    impl std::error::Error for JWTError {}
-
-    /// Claims payload. Matches the wire shape of the platform JWT
-    /// primitive — standard fields plus an open `custom` map.
-    #[derive(Debug, Clone, Default)]
-    pub struct Claims {
-        pub sub: Option<String>,
-        pub iat: Option<i64>,
-        pub exp: Option<i64>,
-        pub nbf: Option<i64>,
-        pub iss: Option<String>,
-        pub aud: Option<Vec<String>>,
-        pub jti: Option<String>,
-        pub custom: Option<Value>,
+    pub struct SqlTx {
+        db: String,
+        token: String,
     }
 
-    /// Sign a JWT with the slice's HS256 JKey. `exp` is required;
-    /// `iat`, `iss`, and `jti` are auto-set when `None`.
-    pub fn issue(claims: Claims) -> String {
-        let mut body = serde_json::Map::new();
-        if let Some(v) = claims.sub    { body.insert("sub".to_string(),    Value::String(v)); }
-        if let Some(v) = claims.iat    { body.insert("iat".to_string(),    Value::from(v)); }
-        if let Some(v) = claims.exp    { body.insert("exp".to_string(),    Value::from(v)); }
-        if let Some(v) = claims.nbf    { body.insert("nbf".to_string(),    Value::from(v)); }
-        if let Some(v) = claims.iss    { body.insert("iss".to_string(),    Value::String(v)); }
-        if let Some(v) = claims.aud    { body.insert("aud".to_string(),    serde_json::to_value(v).unwrap_or(Value::Null)); }
-        if let Some(v) = claims.jti    { body.insert("jti".to_string(),    Value::String(v)); }
-        if let Some(v) = claims.custom { body.insert("custom".to_string(), v); }
-
-        match call("POST", "jwt/sign", Some(Value::Object(body))) {
-            Some(Value::Object(m)) => {
-                m.get("token").and_then(|v| v.as_str()).unwrap_or_default().to_string()
-            }
-            _ => String::new(),
-        }
+    #[derive(Default, Debug, Clone)]
+    pub struct SqlExecResult {
+        pub rows_affected: i64,
+        pub last_insert_id: i64,
     }
 
-    /// Validate a token. Returns parsed claims on success; `JWTError`
-    /// on validation failure.
-    pub fn verify(token: &str, audience: Option<&str>, allowed_issuer: Option<&str>) -> Result<Value, JWTError> {
-        let mut body = serde_json::Map::new();
-        body.insert("token".to_string(), Value::String(token.to_string()));
-        if let Some(a) = audience { body.insert("audience".to_string(), Value::String(a.to_string())); }
-        if let Some(i) = allowed_issuer { body.insert("allowed_issuer".to_string(), Value::String(i.to_string())); }
-
-        let resp = match call("POST", "jwt/verify", Some(Value::Object(body))) {
-            Some(Value::Object(m)) => m,
-            _ => return Err(JWTError { reason: "internal_error".to_string() }),
+    fn sql_exec_from_value(v: Option<Value>) -> SqlExecResult {
+        let v = match v {
+            Some(v) => v,
+            None => return SqlExecResult::default(),
         };
-        let valid = resp.get("valid").and_then(|v| v.as_bool()).unwrap_or(false);
-        if !valid {
-            let reason = resp.get("reason").and_then(|v| v.as_str()).unwrap_or("internal_error").to_string();
-            return Err(JWTError { reason });
+        SqlExecResult {
+            rows_affected: v.get("rows_affected").and_then(|x| x.as_i64()).unwrap_or(0),
+            last_insert_id: v.get("last_insert_id").and_then(|x| x.as_i64()).unwrap_or(0),
         }
-        Ok(resp.get("claims").cloned().unwrap_or(Value::Null))
     }
 
-    /// The slice's auto-set issuer string ("drift-slice-<user>-<slice>").
-    pub fn slice_id() -> String {
-        match call("GET", "jwt/slice-id", None) {
-            Some(Value::Object(m)) => {
-                m.get("slice_id").and_then(|v| v.as_str()).unwrap_or_default().to_string()
-            }
-            _ => String::new(),
+    pub fn sql<S: Into<String>>(name: S) -> SqlDb {
+        SqlDb { name: name.into() }
+    }
+
+    fn sql_rows(resp: Option<Value>) -> Vec<serde_json::Map<String, Value>> {
+        let v = match resp {
+            Some(v) => v,
+            None => return vec![],
+        };
+        let cols: Vec<String> = v
+            .get("columns")
+            .and_then(|c| c.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|e| e.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let rows = v.get("rows").and_then(|r| r.as_array()).cloned().unwrap_or_default();
+        rows.into_iter()
+            .map(|row| {
+                let arr = row.as_array().cloned().unwrap_or_default();
+                let mut map = serde_json::Map::new();
+                for (i, col) in cols.iter().enumerate() {
+                    map.insert(col.clone(), arr.get(i).cloned().unwrap_or(Value::Null));
+                }
+                map
+            })
+            .collect()
+    }
+
+    impl SqlDb {
+        pub fn query(&self, sql: &str, args: &[Value]) -> Vec<serde_json::Map<String, Value>> {
+            let body = serde_json::json!({"db": self.name, "sql": sql, "args": args});
+            sql_rows(call("POST", "sql/query", Some(body)))
+        }
+
+        pub fn execute(&self, sql: &str, args: &[Value]) -> SqlExecResult {
+            let body = serde_json::json!({"db": self.name, "sql": sql, "args": args});
+            sql_exec_from_value(call("POST", "sql/execute", Some(body)))
+        }
+
+        pub fn begin(&self) -> Option<SqlTx> {
+            let body = serde_json::json!({"db": self.name});
+            let raw = call("POST", "sql/begin", Some(body))?;
+            let token = raw.get("tx")?.as_str()?.to_string();
+            Some(SqlTx { db: self.name.clone(), token })
+        }
+    }
+
+    impl SqlTx {
+        pub fn query(&self, sql: &str, args: &[Value]) -> Vec<serde_json::Map<String, Value>> {
+            let body = serde_json::json!({"db": self.db, "sql": sql, "args": args, "tx": self.token});
+            sql_rows(call("POST", "sql/query", Some(body)))
+        }
+
+        pub fn execute(&self, sql: &str, args: &[Value]) -> SqlExecResult {
+            let body = serde_json::json!({"db": self.db, "sql": sql, "args": args, "tx": self.token});
+            sql_exec_from_value(call("POST", "sql/execute", Some(body)))
+        }
+
+        pub fn commit(&self) {
+            let _ = call("POST", "sql/commit", Some(serde_json::json!({"tx": self.token})));
+        }
+
+        pub fn rollback(&self) {
+            let _ = call("POST", "sql/rollback", Some(serde_json::json!({"tx": self.token})));
         }
     }
 }
@@ -1015,107 +1245,85 @@ where
     handler(req, &mut conn);
 }
 
-// ─── SQL ────────────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// Slice-to-slice linking (top-level; the seed of a future "D" pillar)
+// ---------------------------------------------------------------------------
 //
-// Per-slice SQLite databases addressed by name. Wire shape: one JSON
-// envelope per call ({db, sql, args, tx?}). See docs/memos/backbone-sql.md.
-//
-//   let db = drift_sdk::sql("clinic");
-//   let rows = db.query("SELECT * FROM appointments WHERE slot >= ?", &[json!("2026-05-01")]);
-//   let res = db.execute("INSERT INTO appointments(...) VALUES(?, ?)", &[json!("alice"), json!("10:00")]);
+// Not Backbone — this is inter-slice networking, parked at the crate root until
+// the fourth pillar lands.
 
-pub struct SqlDb {
+fn link_env_name(name: &str) -> String {
+    let mangled: String = name
+        .to_uppercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    format!("DRIFT_LINK_{}_URL", mangled)
+}
+
+/// A client for another slice you've LINKED to (`drift slice link`). The call
+/// travels in-cluster and carries this slice's identity (X-Drift-Slice).
+pub struct SliceClient {
     name: String,
 }
 
-pub struct SqlTx {
-    db: String,
-    token: String,
+pub fn slice(name: &str) -> SliceClient {
+    SliceClient { name: name.to_string() }
 }
 
-#[derive(Default, Debug, Clone)]
-pub struct SqlExecResult {
-    pub rows_affected: i64,
-    pub last_insert_id: i64,
-}
+impl SliceClient {
+    fn url(&self, path: &str) -> Result<String, String> {
+        let base = std::env::var(link_env_name(&self.name)).unwrap_or_default();
+        if base.is_empty() {
+            return Err(format!(
+                "drift: not linked to slice \"{}\" — run `drift slice link add {}`",
+                self.name, self.name
+            ));
+        }
+        Ok(format!("{}/{}", base.trim_end_matches('/'), path.trim_start_matches('/')))
+    }
 
-fn sql_exec_from_value(v: Option<Value>) -> SqlExecResult {
-    let v = match v {
-        Some(v) => v,
-        None => return SqlExecResult::default(),
-    };
-    SqlExecResult {
-        rows_affected: v.get("rows_affected").and_then(|x| x.as_i64()).unwrap_or(0),
-        last_insert_id: v.get("last_insert_id").and_then(|x| x.as_i64()).unwrap_or(0),
+    /// Issue a request to the linked slice. On (0, msg) the link is missing.
+    pub fn request(
+        &self,
+        method: &str,
+        path: &str,
+        headers: Option<HashMap<String, String>>,
+        body: Option<&str>,
+    ) -> (u16, String) {
+        let url = match self.url(path) {
+            Ok(u) => u,
+            Err(e) => return (0, e),
+        };
+        let mut h = headers.unwrap_or_default();
+        h.insert("X-Drift-Slice".to_string(), std::env::var("DRIFT_SLICE").unwrap_or_default());
+        http_request(method, &url, Some(h), body)
+    }
+
+    pub fn get(&self, path: &str) -> (u16, String) {
+        self.request("GET", path, None, None)
+    }
+
+    pub fn post(&self, path: &str, body: Option<&str>) -> (u16, String) {
+        let mut h = HashMap::new();
+        h.insert("Content-Type".to_string(), "application/json".to_string());
+        self.request("POST", path, Some(h), body)
     }
 }
 
-pub fn sql<S: Into<String>>(name: S) -> SqlDb {
-    SqlDb { name: name.into() }
-}
-
-fn sql_rows(resp: Option<Value>) -> Vec<serde_json::Map<String, Value>> {
-    let v = match resp {
-        Some(v) => v,
-        None => return vec![],
-    };
-    let cols: Vec<String> = v
-        .get("columns")
-        .and_then(|c| c.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|e| e.as_str().map(|s| s.to_string()))
-                .collect()
-        })
-        .unwrap_or_default();
-    let rows = v.get("rows").and_then(|r| r.as_array()).cloned().unwrap_or_default();
-    rows.into_iter()
-        .map(|row| {
-            let arr = row.as_array().cloned().unwrap_or_default();
-            let mut map = serde_json::Map::new();
-            for (i, col) in cols.iter().enumerate() {
-                map.insert(col.clone(), arr.get(i).cloned().unwrap_or(Value::Null));
+/// The linked slice that called this request, or "" if not via a link.
+pub fn caller_slice(req: &Value) -> String {
+    if let Some(headers) = req.get("headers").and_then(|h| h.as_object()) {
+        for (k, v) in headers {
+            if k.eq_ignore_ascii_case("x-drift-slice") {
+                return v.as_str().unwrap_or_default().to_string();
             }
-            map
-        })
-        .collect()
+        }
+    }
+    String::new()
 }
 
-impl SqlDb {
-    pub fn query(&self, sql: &str, args: &[Value]) -> Vec<serde_json::Map<String, Value>> {
-        let body = serde_json::json!({"db": self.name, "sql": sql, "args": args});
-        sql_rows(call("POST", "sql/query", Some(body)))
-    }
-
-    pub fn execute(&self, sql: &str, args: &[Value]) -> SqlExecResult {
-        let body = serde_json::json!({"db": self.name, "sql": sql, "args": args});
-        sql_exec_from_value(call("POST", "sql/execute", Some(body)))
-    }
-
-    pub fn begin(&self) -> Option<SqlTx> {
-        let body = serde_json::json!({"db": self.name});
-        let raw = call("POST", "sql/begin", Some(body))?;
-        let token = raw.get("tx")?.as_str()?.to_string();
-        Some(SqlTx { db: self.name.clone(), token })
-    }
-}
-
-impl SqlTx {
-    pub fn query(&self, sql: &str, args: &[Value]) -> Vec<serde_json::Map<String, Value>> {
-        let body = serde_json::json!({"db": self.db, "sql": sql, "args": args, "tx": self.token});
-        sql_rows(call("POST", "sql/query", Some(body)))
-    }
-
-    pub fn execute(&self, sql: &str, args: &[Value]) -> SqlExecResult {
-        let body = serde_json::json!({"db": self.db, "sql": sql, "args": args, "tx": self.token});
-        sql_exec_from_value(call("POST", "sql/execute", Some(body)))
-    }
-
-    pub fn commit(&self) {
-        let _ = call("POST", "sql/commit", Some(serde_json::json!({"tx": self.token})));
-    }
-
-    pub fn rollback(&self) {
-        let _ = call("POST", "sql/rollback", Some(serde_json::json!({"tx": self.token})));
-    }
+/// An environment variable value ("" if unset).
+pub fn env(key: &str) -> String {
+    std::env::var(key).unwrap_or_default()
 }

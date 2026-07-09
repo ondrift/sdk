@@ -114,27 +114,16 @@ function _getBackboneUrl() {
 
 // _initBackboneTransport parses BACKBONE_URL once and caches a
 // node http.Agent + the per-request options that route to it.
-//
-//   - http://host:port    → TCP HTTP with keep-alive Agent.
-//   - unix:///path/to/sk  → Unix Domain Socket via { socketPath }.
-//
-// Slice main injects unix:// by default to eliminate the TCP loopback
-// overhead (~0.3ms per call). drift atomic run still uses TCP.
+// BACKBONE_URL is an http://host:port TCP URL.
 function _initBackboneTransport(rawUrl) {
   const http = require("http");
-  if (rawUrl.startsWith("unix://")) {
-    const sockPath = rawUrl.slice("unix://".length);
-    _backboneAgent = new http.Agent({ keepAlive: true, maxSockets: 10 });
-    _backboneRequestOpts = { socketPath: sockPath, agent: _backboneAgent };
-  } else {
-    const u = new URL(rawUrl);
-    _backboneAgent = new http.Agent({ keepAlive: true, maxSockets: 10 });
-    _backboneRequestOpts = {
-      host: u.hostname,
-      port: u.port || 80,
-      agent: _backboneAgent,
-    };
-  }
+  const u = new URL(rawUrl);
+  _backboneAgent = new http.Agent({ keepAlive: true, maxSockets: 10 });
+  _backboneRequestOpts = {
+    host: u.hostname,
+    port: u.port || 80,
+    agent: _backboneAgent,
+  };
 }
 
 function _backboneRequest(method, path, body, contentType) {
@@ -771,9 +760,121 @@ function _sqlTx(db, token) {
   };
 }
 
+// ─── Realtime (backbone.realtime) ─────────────────────────────────────────────
+//
+// Server-originated pub/sub. Subscribers connect over WebSocket at the Canvas
+// route /realtime/<name>; a function fans a message out to all of them with
+// backbone.realtime.channel(name).publish(msg).
+const realtime = {
+  channel: (name) => ({
+    publish: async (msg) => {
+      const resp = await _call("POST", "realtime/publish", { channel: name, message: msg });
+      return (resp && resp.recipients) || 0;
+    },
+    presence: async () => {
+      const resp = await _call("GET", `realtime/presence?channel=${encodeURIComponent(name)}`);
+      return (resp && resp.present) || 0;
+    },
+  }),
+};
+
+// ─── KeyAuth (backbone.keyauth) ───────────────────────────────────────────────
+//
+// Passwordless Ed25519 device-key auth. uid = the public key. challenge mints a
+// one-time nonce; the client signs the canonical {domain,nonce,pubkey}; verify
+// checks the signature and returns THIS slice's session JWT (sub = pubkey). The
+// client half (keygen + recovery phrase) is the @ondrift/keyauth library.
+const keyauth = {
+  challenge: async (pubkey) => {
+    const resp = await _call("POST", "keyauth/challenge", { pubkey });
+    return (resp && resp.nonce) || "";
+  },
+  verify: async (pubkey, sig, domain) => {
+    const resp = await _call("POST", "keyauth/verify", { pubkey, sig, domain });
+    return (resp && resp.token) || "";
+  },
+};
+
+// ─── Vault (backbone.vault) ───────────────────────────────────────────────────
+//
+// Zero-knowledge recovery store: user-scoped, append-only, opaque. The client
+// encrypts the blob under a key the slice never sees, so Drift stores it but
+// can't read it. Backed by the `keyvault` NoSQL collection (declare it).
+const vault = {
+  put: async (uid, blob) => {
+    await nosql.collection("keyvault").insert({
+      _id: `${uid}:${process.hrtime.bigint()}`,
+      user_id: uid,
+      blob,
+      updated_at: Math.floor(Date.now() / 1000),
+    });
+  },
+  get: async (uid) => {
+    const rows = await nosql.collection("keyvault").list({ user_id: uid });
+    let bestAt = -1;
+    let best = null;
+    for (const r of rows) {
+      const at = (r && r.updated_at) || 0;
+      if (at >= bestAt) { bestAt = at; best = r.blob; }
+    }
+    return best === undefined ? null : best;
+  },
+};
+
+// ─── Backbone — the B of the sacred A·B·C triad ───────────────────────────────
+//
+// The single entrypoint for every stateful primitive. Nothing stateful lives at
+// the top level; the triad is the namespace for everything under it.
+const backbone = { secret, cache, nosql, queue, blob, lock, sql, jwt, realtime, keyauth, vault };
+
+// ─── Slice-to-slice linking (top-level; seed of a future "D") ─────────────────
+
+function _linkEnvName(name) {
+  return "DRIFT_LINK_" + name.toUpperCase().replace(/[^A-Z0-9]/g, "_") + "_URL";
+}
+
+// slice(name) returns a client for a slice you're LINKED to (drift slice link).
+// The call travels in-cluster and carries this slice's identity (X-Drift-Slice).
+function slice(name) {
+  const resolveURL = (path) => {
+    const baseUrl = process.env[_linkEnvName(name)];
+    if (!baseUrl) throw new Error(`drift: not linked to slice "${name}" — run \`drift slice link add ${name}\``);
+    return baseUrl.replace(/\/+$/, "") + "/" + String(path).replace(/^\/+/, "");
+  };
+  const request = (method, path, headers, body) =>
+    httpRequest(method, resolveURL(path), Object.assign({ "X-Drift-Slice": process.env.DRIFT_SLICE || "" }, headers || {}), body);
+  return {
+    request,
+    get: (path) => request("GET", path, null, null),
+    post: (path, body) => request("POST", path, { "Content-Type": "application/json" }, body),
+  };
+}
+
+// callerSlice returns the linked slice that called this request, or "" if the
+// request didn't arrive over a slice-to-slice link (case-insensitive header).
+function callerSlice(req) {
+  const h = (req && req.headers) || {};
+  for (const k of Object.keys(h)) {
+    if (k.toLowerCase() === "x-drift-slice") return h[k];
+  }
+  return "";
+}
+
+// env returns an environment variable value ("" if unset).
+function env(key) {
+  return process.env[key] || "";
+}
+
+// ---------------------------------------------------------------------------
+// Exports — single canonical assignment. State primitives live under
+// `backbone` (the sacred triad); Atomic entrypoints, utilities, and the
+// proto-"D" slice-link stay top-level.
+// ---------------------------------------------------------------------------
+
 module.exports = {
   run, runSSE, runWS,
-  log, httpRequest,
-  secret, cache, nosql, queue, blob, lock, sql,
-  jwt, JWTError,
+  log, httpRequest, env,
+  backbone,
+  slice, callerSlice,
+  JWTError,
 };

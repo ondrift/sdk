@@ -4,14 +4,18 @@
  *
  * This single-file SDK provides:
  *   - \Drift\run($handler): Entry point that dispatches to deployed or local mode.
- *   - Backbone helpers: Secret, Cache, Nosql, Queue, Blob, Lock.
+ *   - \Drift\Backbone\* — the B of the sacred A·B·C triad; the SOLE entrypoint
+ *     for every STATE primitive: Secret, Cache, Nosql, queue, Blob, Lock, JWT,
+ *     sql, Realtime, KeyAuth, Vault. (There is no \Drift\Secret etc. — go
+ *     through the \Drift\Backbone namespace.)
  *   - \Drift\log($msg): Writes to stderr (captured by the runner as function logs).
  *   - \Drift\http_request(): Outbound HTTP from within a function.
+ *   - \Drift\slice($name) / \Drift\caller_slice($req): slice-to-slice linking.
  *
  * All backbone helpers use only PHP built-ins -- zero external dependencies.
  */
 
-namespace Drift;
+namespace Drift {
 
 // ---------------------------------------------------------------------------
 // Entry point
@@ -111,16 +115,11 @@ function _get_backbone_url(): string {
     return $_backbone_url;
 }
 
-// _backbone_http issues a request to the backbone over either a Unix Domain
-// Socket (BACKBONE_URL=unix:///path — the slice default: lower latency, no TCP
-// surface) or TCP (http://host:port, used by `drift atomic run`). Returns
-// [status_code, body]. Stdlib only — stream_socket_client for UDS, the http
-// stream wrapper for TCP.
+// _backbone_http issues a request to the backbone over TCP
+// (BACKBONE_URL=http://host:port). Returns [status_code, body]. Stdlib only —
+// the http stream wrapper.
 function _backbone_http(string $method, string $path, ?string $body, string $content_type): array {
     $base = _get_backbone_url();
-    if (strpos($base, 'unix://') === 0) {
-        return _backbone_uds(substr($base, strlen('unix://')), $method, "/$path", $body, $content_type);
-    }
     // TLS verification is explicit even though Backbone is loopback in
     // production — keeps the policy uniform with http_request().
     $opts = [
@@ -137,48 +136,6 @@ function _backbone_http(string $method, string $path, ?string $body, string $con
         $status = (int) $m[1];
     }
     return [$status, $result === false ? null : $result];
-}
-
-function _backbone_uds(string $sock_path, string $method, string $path, ?string $body, string $content_type): array {
-    $fp = @stream_socket_client("unix://$sock_path", $errno, $errstr, 30);
-    if (!$fp) return [0, null];
-    $req = "$method $path HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n";
-    if ($body !== null) {
-        $req .= "Content-Type: $content_type\r\nContent-Length: " . strlen($body) . "\r\n";
-    }
-    $req .= "\r\n";
-    if ($body !== null) $req .= $body;
-    fwrite($fp, $req);
-    $raw = '';
-    while (!feof($fp)) { $raw .= fread($fp, 8192); }
-    fclose($fp);
-    return _parse_http($raw);
-}
-
-// _parse_http splits a raw HTTP/1.1 response into [status_code, body],
-// decoding Transfer-Encoding: chunked when present (Content-Length otherwise).
-function _parse_http(string $raw): array {
-    $pos = strpos($raw, "\r\n\r\n");
-    if ($pos === false) return [0, null];
-    $lines = explode("\r\n", substr($raw, 0, $pos));
-    $rest = substr($raw, $pos + 4);
-    $status = preg_match('#^HTTP/\S+\s+(\d+)#', $lines[0], $m) ? (int) $m[1] : 0;
-    $chunked = false;
-    foreach ($lines as $l) {
-        if (stripos($l, 'transfer-encoding:') === 0 && stripos($l, 'chunked') !== false) { $chunked = true; break; }
-    }
-    if (!$chunked) return [$status, $rest];
-    $body = '';
-    $buf = $rest;
-    while (true) {
-        $nl = strpos($buf, "\r\n");
-        if ($nl === false) break;
-        $size = hexdec(substr($buf, 0, $nl));
-        if ($size <= 0) break;
-        $body .= substr($buf, $nl + 2, $size);
-        $buf = substr($buf, $nl + 2 + $size + 2);
-    }
-    return [$status, $body];
 }
 
 function _call(string $method, string $path, $body = null) {
@@ -298,6 +255,284 @@ function _call_local(string $method, string $path, $body = null) {
 
     return null;
 }
+
+// ---------------------------------------------------------------------------
+// JWT error type
+// ---------------------------------------------------------------------------
+
+/**
+ * Thrown by Drift\Backbone\JWT::verify on validation failure. ``reason`` is one
+ * of the stable wire strings: malformed, bad_signature, expired,
+ * not_yet_valid, wrong_algorithm, wrong_issuer, wrong_audience,
+ * invalid_claims, missing_exp, internal_error. Kept at the top level (it is an
+ * error type, not a state entrypoint).
+ */
+class JWTError extends \Exception {
+    public string $reason;
+    public function __construct(string $reason) {
+        parent::__construct("jwt verify: $reason");
+        $this->reason = $reason;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Logging
+// ---------------------------------------------------------------------------
+
+function log($msg): void {
+    fwrite(STDERR, strval($msg) . "\n");
+}
+
+// ---------------------------------------------------------------------------
+// HTTP client
+// ---------------------------------------------------------------------------
+
+// Default 30s timeout. A function calling a hung remote shouldn't
+// hold an Atomic invocation open longer than this; the runner's
+// per-invocation deadline is the absolute ceiling.
+//
+// TLS verification (`verify_peer` + `verify_peer_name`) is set
+// explicitly even though both default to true on PHP 5.6+ — making
+// the intent visible to anyone reading this for security review.
+function http_request(string $method, string $url, ?array $headers = null, $body = null, int $timeout = 30): array {
+    $opts = [
+        'http' => [
+            'method'        => $method,
+            'ignore_errors' => true,
+            'timeout'       => $timeout,
+        ],
+        'ssl' => [
+            'verify_peer'      => true,
+            'verify_peer_name' => true,
+        ],
+    ];
+
+    $header_str = '';
+    if ($headers) {
+        foreach ($headers as $k => $v) {
+            $header_str .= "$k: $v\r\n";
+        }
+    }
+    if ($body !== null) {
+        $opts['http']['content'] = is_string($body) ? $body : json_encode($body);
+    }
+    if ($header_str) $opts['http']['header'] = $header_str;
+
+    $context = stream_context_create($opts);
+    $result = @file_get_contents($url, false, $context);
+
+    $status = 0;
+    if (isset($http_response_header[0]) && preg_match('/^HTTP\/\S+ (\d+)/', $http_response_header[0], $m)) {
+        $status = (int)$m[1];
+    }
+
+    return ['status' => $status, 'body' => $result ?: ''];
+}
+
+// ─── SSE ────────────────────────────────────────────────────────────────────
+
+function run_sse(callable $handler): void {
+    if (getenv('DRIFT_RUNTIME')) {
+        $input = file_get_contents('php://stdin');
+        $req = json_decode($input, true) ?? [];
+        $emit = function(string $event, $data) {
+            if ($event) fwrite(STDOUT, "event: $event\n");
+            fwrite(STDOUT, "data: " . json_encode($data) . "\n\n");
+            fflush(STDOUT);
+        };
+        $handler($req, $emit);
+        return;
+    }
+    _run_local_sse($handler);
+}
+
+// Local-dev SSE server. Mirrors `_run_local`'s socket plumbing but writes the
+// HTTP response chunks incrementally and flushes after every emit so each
+// SSE event reaches the client immediately. PHP's output buffering is the
+// usual cause of "events arrive in one burst at the end" — fflush() defeats
+// it on the per-connection socket level.
+function _run_local_sse(callable $handler): void {
+    $port = (int)(getenv('PORT') ?: '8080');
+    $server = stream_socket_server("tcp://0.0.0.0:$port", $errno, $errstr);
+    if (!$server) {
+        fwrite(STDERR, "drift-sdk: failed to start SSE server: $errstr ($errno)\n");
+        exit(1);
+    }
+    fwrite(STDERR, "drift-sdk: local SSE server starting on :$port\n");
+
+    while ($client = @stream_socket_accept($server, -1)) {
+        try {
+            $request_line = fgets($client);
+            if (!$request_line) { fclose($client); continue; }
+            $parts = explode(' ', trim($request_line));
+            if (count($parts) < 2) { fclose($client); continue; }
+            $method = $parts[0];
+            $path_str = $parts[1];
+
+            $headers = [];
+            while (($line = fgets($client)) && trim($line) !== '') {
+                $pair = explode(': ', trim($line), 2);
+                if (count($pair) === 2) {
+                    $headers[strtolower($pair[0])] = $pair[1];
+                }
+            }
+
+            $body = null;
+            if (isset($headers['content-length'])) {
+                $raw = fread($client, (int)$headers['content-length']);
+                $decoded = json_decode($raw, true);
+                $body = ($decoded !== null) ? $decoded : $raw;
+            }
+
+            $parsed = parse_url($path_str);
+            $req = [
+                'path' => $parsed['path'] ?? '/',
+                'headers' => $headers,
+                'query' => $parsed['query'] ?? '',
+                'body' => $body,
+            ];
+
+            fwrite($client,
+                "HTTP/1.1 200 OK\r\n" .
+                "Content-Type: text/event-stream\r\n" .
+                "Cache-Control: no-cache, no-transform\r\n" .
+                "Connection: keep-alive\r\n" .
+                "X-Accel-Buffering: no\r\n" .
+                "\r\n"
+            );
+            fflush($client);
+
+            $emit = function(string $event, $data) use ($client) {
+                if ($event) fwrite($client, "event: $event\n");
+                fwrite($client, "data: " . json_encode($data) . "\n\n");
+                fflush($client);
+            };
+
+            try {
+                $handler($req, $emit);
+            } catch (\Throwable $e) {
+                @fwrite($client, "event: error\ndata: " . json_encode(['error' => $e->getMessage()]) . "\n\n");
+            }
+        } catch (\Throwable $e) {
+            fwrite(STDERR, "drift-sdk: {$e->getMessage()}\n");
+        } finally {
+            @fclose($client);
+        }
+    }
+}
+
+// ─── WebSocket ──────────────────────────────────────────────────────────────
+
+class WsConn {
+    public function read() {
+        $line = fgets(STDIN);
+        if ($line === false) return null;
+        $line = trim($line);
+        if ($line === '') return null;
+        $decoded = json_decode($line, true);
+        return ($decoded !== null) ? $decoded : $line;
+    }
+
+    public function write($data): void {
+        fwrite(STDOUT, json_encode($data) . "\n");
+        fflush(STDOUT);
+    }
+
+    public function write_raw(string $msg): void {
+        fwrite(STDOUT, $msg . "\n");
+        fflush(STDOUT);
+    }
+}
+
+function run_ws(callable $handler): void {
+    if (getenv('DRIFT_RUNTIME')) {
+        $firstLine = fgets(STDIN);
+        $req = $firstLine ? json_decode(trim($firstLine), true) : [];
+        $conn = new WsConn();
+        $handler($req, $conn);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Slice-to-slice linking (top-level; the seed of a future "D" pillar)
+// ---------------------------------------------------------------------------
+//
+// Not Backbone — this is inter-slice networking, parked at the top level until
+// the fourth pillar lands.
+
+function _link_env_name(string $name): string {
+    return 'DRIFT_LINK_' . preg_replace('/[^A-Z0-9]/', '_', strtoupper($name)) . '_URL';
+}
+
+class SliceClient {
+    private string $name;
+
+    public function __construct(string $name) { $this->name = $name; }
+
+    private function _url(string $path): string {
+        $base = getenv(_link_env_name($this->name));
+        if ($base === false || $base === '') {
+            throw new \RuntimeException(
+                "drift: not linked to slice \"{$this->name}\" — run `drift slice link add {$this->name}`"
+            );
+        }
+        return rtrim($base, '/') . '/' . ltrim($path, '/');
+    }
+
+    public function request(string $method, string $path, ?array $headers = null, $body = null): array {
+        $h = array_merge(['X-Drift-Slice' => getenv('DRIFT_SLICE') ?: ''], $headers ?? []);
+        return http_request($method, $this->_url($path), $h, $body);
+    }
+
+    public function get(string $path): array {
+        return $this->request('GET', $path);
+    }
+
+    public function post(string $path, $body = null): array {
+        return $this->request('POST', $path,
+            ['Content-Type' => 'application/json'],
+            $body === null ? null : json_encode($body));
+    }
+}
+
+/**
+ * A client for another slice you've LINKED to (`drift slice link`). The call
+ * travels in-cluster and carries this slice's identity (X-Drift-Slice).
+ */
+function slice(string $name): SliceClient {
+    return new SliceClient($name);
+}
+
+/** The linked slice that called this request, or "" if not via a link. */
+function caller_slice(array $req): string {
+    $headers = $req['headers'] ?? [];
+    foreach ($headers as $k => $v) {
+        if (strtolower($k) === 'x-drift-slice') return $v;
+    }
+    return '';
+}
+
+/** An environment variable value ("" if unset). */
+function env(string $key): string {
+    $v = getenv($key);
+    return $v !== false ? $v : '';
+}
+
+} // namespace Drift
+
+// ===========================================================================
+// Backbone — the B of the sacred A·B·C triad. The SOLE entrypoint for every
+// state primitive. Reach these as \Drift\Backbone\Secret::get(...),
+// \Drift\Backbone\queue(...), \Drift\Backbone\Realtime::channel(...), etc.
+// Nothing stateful lives in the top-level \Drift namespace.
+// ===========================================================================
+
+namespace Drift\Backbone {
+
+use function Drift\_call;
+use function Drift\_call_raw;
+use function Drift\_backbone_http;
+use function Drift\_get_backbone_url;
 
 // ---------------------------------------------------------------------------
 // Secret
@@ -481,20 +716,6 @@ class Lock {
 //
 // Design: internal/todo/slice-jwt-primitive.md.
 
-/**
- * Thrown by Drift\JWT::verify on validation failure. ``reason`` is one of
- * the stable wire strings: malformed, bad_signature, expired,
- * not_yet_valid, wrong_algorithm, wrong_issuer, wrong_audience,
- * invalid_claims, missing_exp, internal_error.
- */
-class JWTError extends \Exception {
-    public string $reason;
-    public function __construct(string $reason) {
-        parent::__construct("jwt verify: $reason");
-        $this->reason = $reason;
-    }
-}
-
 class JWT {
     /**
      * Sign a JWT with the slice's HS256 JKey. ``exp`` is required;
@@ -524,10 +745,10 @@ class JWT {
         if ($allowed_issuer !== null) $body['allowed_issuer'] = $allowed_issuer;
         $resp = _call('POST', 'jwt/verify', $body);
         if (!is_array($resp)) {
-            throw new JWTError('internal_error');
+            throw new \Drift\JWTError('internal_error');
         }
         if (empty($resp['valid'])) {
-            throw new JWTError($resp['reason'] ?? 'internal_error');
+            throw new \Drift\JWTError($resp['reason'] ?? 'internal_error');
         }
         return $resp['claims'] ?? [];
     }
@@ -540,192 +761,102 @@ class JWT {
 }
 
 // ---------------------------------------------------------------------------
-// Logging
+// Realtime — pub/sub fan-out over the slice's Canvas WebSocket hub.
 // ---------------------------------------------------------------------------
-
-function log($msg): void {
-    fwrite(STDERR, strval($msg) . "\n");
-}
-
-// ---------------------------------------------------------------------------
-// HTTP client
-// ---------------------------------------------------------------------------
-
-// Default 30s timeout. A function calling a hung remote shouldn't
-// hold an Atomic invocation open longer than this; the runner's
-// per-invocation deadline is the absolute ceiling.
 //
-// TLS verification (`verify_peer` + `verify_peer_name`) is set
-// explicitly even though both default to true on PHP 5.6+ — making
-// the intent visible to anyone reading this for security review.
-function http_request(string $method, string $url, ?array $headers = null, $body = null, int $timeout = 30): array {
-    $opts = [
-        'http' => [
-            'method'        => $method,
-            'ignore_errors' => true,
-            'timeout'       => $timeout,
-        ],
-        'ssl' => [
-            'verify_peer'      => true,
-            'verify_peer_name' => true,
-        ],
-    ];
+// Subscribers connect over WebSocket at the Canvas route /realtime/<name>;
+// publish fans a message out to every connected subscriber.
 
-    $header_str = '';
-    if ($headers) {
-        foreach ($headers as $k => $v) {
-            $header_str .= "$k: $v\r\n";
+class Realtime {
+    public static function channel(string $name): RealtimeChannel {
+        return new RealtimeChannel($name);
+    }
+}
+
+class RealtimeChannel {
+    private string $name;
+
+    public function __construct(string $name) { $this->name = $name; }
+
+    /** Publish a message to every subscriber. Returns the recipient count. */
+    public function publish($message): int {
+        $resp = _call('POST', 'realtime/publish', ['channel' => $this->name, 'message' => $message]);
+        return is_array($resp) ? (int)($resp['recipients'] ?? 0) : 0;
+    }
+
+    /** The number of subscribers currently connected to this channel. */
+    public function presence(): int {
+        $resp = _call('GET', 'realtime/presence?channel=' . urlencode($this->name));
+        return is_array($resp) ? (int)($resp['present'] ?? 0) : 0;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// KeyAuth — passwordless Ed25519 device-key auth.
+// ---------------------------------------------------------------------------
+//
+// uid = the public key. ``challenge`` mints a one-time nonce; the client signs
+// the canonical {domain,nonce,pubkey}; ``verify`` checks the signature and
+// returns THIS slice's session JWT. ``domain`` namespaces the signature per
+// app (replay-safety).
+
+class KeyAuth {
+    public static function challenge(string $pubkey): string {
+        $resp = _call('POST', 'keyauth/challenge', ['pubkey' => $pubkey]);
+        return is_array($resp) ? (string)($resp['nonce'] ?? '') : '';
+    }
+
+    public static function verify(string $pubkey, string $sig, string $domain): string {
+        $resp = _call('POST', 'keyauth/verify', ['pubkey' => $pubkey, 'sig' => $sig, 'domain' => $domain]);
+        return is_array($resp) ? (string)($resp['token'] ?? '') : '';
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Vault — zero-knowledge recovery store (Layer B).
+// ---------------------------------------------------------------------------
+//
+// User-scoped, append-only, opaque. The client encrypts the blob under a key
+// the slice never sees. Backed by the `keyvault` NoSQL collection (declare it
+// in your Driftfile).
+
+class Vault {
+    public static function put(string $uid, string $blob): void {
+        $nanos = hrtime(true);
+        Nosql::collection('keyvault')->insert([
+            '_id'        => "$uid:$nanos",
+            'user_id'    => $uid,
+            'blob'       => $blob,
+            'updated_at' => time(),
+        ]);
+    }
+
+    public static function get(string $uid) {
+        $rows = Nosql::collection('keyvault')->list(['user_id' => $uid]);
+        $best_at = -1;
+        $best = null;
+        foreach ($rows as $r) {
+            if (!is_array($r)) continue;
+            $at = $r['updated_at'] ?? 0;
+            if ($at >= $best_at) {
+                $best_at = $at;
+                $best = $r['blob'] ?? null;
+            }
         }
-    }
-    if ($body !== null) {
-        $opts['http']['content'] = is_string($body) ? $body : json_encode($body);
-    }
-    if ($header_str) $opts['http']['header'] = $header_str;
-
-    $context = stream_context_create($opts);
-    $result = @file_get_contents($url, false, $context);
-
-    $status = 0;
-    if (isset($http_response_header[0]) && preg_match('/^HTTP\/\S+ (\d+)/', $http_response_header[0], $m)) {
-        $status = (int)$m[1];
-    }
-
-    return ['status' => $status, 'body' => $result ?: ''];
-}
-
-// ─── SSE ────────────────────────────────────────────────────────────────────
-
-function run_sse(callable $handler): void {
-    if (getenv('DRIFT_RUNTIME')) {
-        $input = file_get_contents('php://stdin');
-        $req = json_decode($input, true) ?? [];
-        $emit = function(string $event, $data) {
-            if ($event) fwrite(STDOUT, "event: $event\n");
-            fwrite(STDOUT, "data: " . json_encode($data) . "\n\n");
-            fflush(STDOUT);
-        };
-        $handler($req, $emit);
-        return;
-    }
-    _run_local_sse($handler);
-}
-
-// Local-dev SSE server. Mirrors `_run_local`'s socket plumbing but writes the
-// HTTP response chunks incrementally and flushes after every emit so each
-// SSE event reaches the client immediately. PHP's output buffering is the
-// usual cause of "events arrive in one burst at the end" — fflush() defeats
-// it on the per-connection socket level.
-function _run_local_sse(callable $handler): void {
-    $port = (int)(getenv('PORT') ?: '8080');
-    $server = stream_socket_server("tcp://0.0.0.0:$port", $errno, $errstr);
-    if (!$server) {
-        fwrite(STDERR, "drift-sdk: failed to start SSE server: $errstr ($errno)\n");
-        exit(1);
-    }
-    fwrite(STDERR, "drift-sdk: local SSE server starting on :$port\n");
-
-    while ($client = @stream_socket_accept($server, -1)) {
-        try {
-            $request_line = fgets($client);
-            if (!$request_line) { fclose($client); continue; }
-            $parts = explode(' ', trim($request_line));
-            if (count($parts) < 2) { fclose($client); continue; }
-            $method = $parts[0];
-            $path_str = $parts[1];
-
-            $headers = [];
-            while (($line = fgets($client)) && trim($line) !== '') {
-                $pair = explode(': ', trim($line), 2);
-                if (count($pair) === 2) {
-                    $headers[strtolower($pair[0])] = $pair[1];
-                }
-            }
-
-            $body = null;
-            if (isset($headers['content-length'])) {
-                $raw = fread($client, (int)$headers['content-length']);
-                $decoded = json_decode($raw, true);
-                $body = ($decoded !== null) ? $decoded : $raw;
-            }
-
-            $parsed = parse_url($path_str);
-            $req = [
-                'path' => $parsed['path'] ?? '/',
-                'headers' => $headers,
-                'query' => $parsed['query'] ?? '',
-                'body' => $body,
-            ];
-
-            fwrite($client,
-                "HTTP/1.1 200 OK\r\n" .
-                "Content-Type: text/event-stream\r\n" .
-                "Cache-Control: no-cache, no-transform\r\n" .
-                "Connection: keep-alive\r\n" .
-                "X-Accel-Buffering: no\r\n" .
-                "\r\n"
-            );
-            fflush($client);
-
-            $emit = function(string $event, $data) use ($client) {
-                if ($event) fwrite($client, "event: $event\n");
-                fwrite($client, "data: " . json_encode($data) . "\n\n");
-                fflush($client);
-            };
-
-            try {
-                $handler($req, $emit);
-            } catch (\Throwable $e) {
-                @fwrite($client, "event: error\ndata: " . json_encode(['error' => $e->getMessage()]) . "\n\n");
-            }
-        } catch (\Throwable $e) {
-            fwrite(STDERR, "drift-sdk: {$e->getMessage()}\n");
-        } finally {
-            @fclose($client);
-        }
-    }
-}
-
-// ─── WebSocket ──────────────────────────────────────────────────────────────
-
-class WsConn {
-    public function read() {
-        $line = fgets(STDIN);
-        if ($line === false) return null;
-        $line = trim($line);
-        if ($line === '') return null;
-        $decoded = json_decode($line, true);
-        return ($decoded !== null) ? $decoded : $line;
-    }
-
-    public function write($data): void {
-        fwrite(STDOUT, json_encode($data) . "\n");
-        fflush(STDOUT);
-    }
-
-    public function write_raw(string $msg): void {
-        fwrite(STDOUT, $msg . "\n");
-        fflush(STDOUT);
-    }
-}
-
-function run_ws(callable $handler): void {
-    if (getenv('DRIFT_RUNTIME')) {
-        $firstLine = fgets(STDIN);
-        $req = $firstLine ? json_decode(trim($firstLine), true) : [];
-        $conn = new WsConn();
-        $handler($req, $conn);
+        return $best;
     }
 }
 
 // ─── SQL ────────────────────────────────────────────────────────────────────
 //
-// Per-slice SQLite databases addressed by name. Wire shape: one JSON
-// envelope per call. See docs/memos/backbone-sql.md.
+// Per-slice SQLite databases addressed by name. Reached via
+// \Drift\Backbone\sql($name). Wire shape: one JSON envelope per call.
+// See docs/memos/backbone-sql.md.
 //
-//   $db = Drift\sql('clinic');
+//   $db = Drift\Backbone\sql('clinic');
 //   $rows = $db->query('SELECT * FROM appointments WHERE slot >= ?', ['2026-05-01']);
 //   $res = $db->execute('INSERT INTO appointments(...) VALUES(?, ?)', ['alice', '10:00']);
-//   $db->transaction(function (Drift\SqlTx $tx) {
+//   $db->transaction(function (Drift\Backbone\SqlTx $tx) {
 //       $tx->execute('UPDATE appointments SET status=? WHERE id=?', ['confirmed', 7]);
 //   });
 //
@@ -818,3 +949,5 @@ class SqlTx {
 function sql(string $name): SqlDb {
     return new SqlDb($name);
 }
+
+} // namespace Drift\Backbone

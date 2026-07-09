@@ -3,12 +3,10 @@ package drift
 import (
 	"bufio"
 	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"maps"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -326,6 +324,15 @@ func (m *memBackbone) handle(req BackboneRequest) []byte {
 		delete(m.locks, name)
 		return nil
 
+	// --- Realtime --- no WS hub in local dev (no slice), so publish/presence
+	// are no-ops: zero subscribers. Keeps Channel().Publish() callable under
+	// `drift atomic run` without a running slice.
+	case path == "realtime/publish" && method == "POST":
+		return marshalJSON(map[string]int{"recipients": 0})
+
+	case path == "realtime/presence" && method == "GET":
+		return marshalJSON(map[string]int{"present": 0})
+
 	}
 
 	return nil
@@ -345,51 +352,11 @@ func callBackbone(method, path string, body any) ([]byte, error) {
 	return callBackboneLocal(method, path, body)
 }
 
-// backboneClient and backboneBase are derived from BACKBONE_URL on first
-// use and cached for the process lifetime.
-//
-//   - http://host:port → use http.DefaultClient, full URL as-is.
-//   - unix:///path     → use a custom client whose Transport dials the
-//     Unix socket; outbound URLs become
-//     "http://localhost/<path>" (host is unused but
-//     must be a valid HTTP URL).
-//
-// The UDS path eliminates the TCP loopback overhead (~0.3ms per call on
-// Drift's hot read paths). Slice main injects unix:// by default;
-// drift atomic run still uses http://127.0.0.1:8000.
-var (
-	backboneClient *http.Client
-	backboneBase   string
-	backboneOnce   sync.Once
-)
-
-func initBackboneClient(rawURL string) {
-	if strings.HasPrefix(rawURL, "unix://") {
-		sockPath := strings.TrimPrefix(rawURL, "unix://")
-		backboneClient = &http.Client{
-			Transport: &http.Transport{
-				DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-					var d net.Dialer
-					return d.DialContext(ctx, "unix", sockPath)
-				},
-				MaxIdleConns:    10,
-				IdleConnTimeout: 60 * time.Second,
-			},
-		}
-		backboneBase = "http://localhost"
-		return
-	}
-	backboneClient = http.DefaultClient
-	backboneBase = rawURL
-}
-
-// callBackboneHTTP calls the real backbone service via HTTP. Routes
-// through a Unix Domain Socket when BACKBONE_URL is unix://, otherwise
-// over TCP localhost.
+// callBackboneHTTP calls the real backbone service via HTTP over TCP
+// localhost. BACKBONE_URL is the full base URL as-is (e.g.
+// http://127.0.0.1:8000).
 func callBackboneHTTP(baseURL, method, path string, body any) ([]byte, error) {
-	backboneOnce.Do(func() { initBackboneClient(baseURL) })
-
-	url := backboneBase + "/" + path
+	url := baseURL + "/" + path
 
 	var bodyReader io.Reader
 	if body != nil {
@@ -408,7 +375,7 @@ func callBackboneHTTP(baseURL, method, path string, body any) ([]byte, error) {
 		req.Header.Set("Content-Type", "application/json")
 	}
 
-	resp, err := backboneClient.Do(req)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("drift: backbone call: %w", err)
 	}
@@ -461,12 +428,56 @@ func callBackboneLocal(method, path string, body any) ([]byte, error) {
 // Namespace API — dot-separated access (drift.Secret.Get, etc.)
 // ================================================================
 
+// ================================================================
+// Backbone — the B of the sacred A·B·C triad and the single
+// entrypoint for every stateful primitive:
+//
+//	drift.Backbone.Secret / NoSQL / Cache / Queue / Blob / Lock /
+//	              JWT / SQL / Realtime / KeyAuth / Vault
+//
+// Nothing stateful lives at the top level — the triad is the namespace
+// for everything under it. (Atomic-side entrypoints like Run live with
+// the runtime; cross-slice calling is the seed of a future "D".)
+// ================================================================
+
+type backboneNS struct {
+	Secret   secretNS
+	NoSQL    nosqlNS
+	Cache    cacheNS
+	Blob     blobNS
+	Lock     lockNS
+	JWT      jwtNS
+	Realtime realtimeNS
+	KeyAuth  keyAuthNS
+	Vault    vaultNS
+}
+
+// Backbone is the entrypoint for all Backbone (state) primitives.
+var Backbone backboneNS
+
+// Queue returns a handle to the named Backbone message queue.
+func (backboneNS) Queue(name string) queueHandle { return queueHandle{name: name} }
+
+// SQL returns a handle to the named Backbone SQLite database (declared in the
+// Driftfile under backbone.sql[]).
+func (backboneNS) SQL(name string) SQLDB { return SQLDB{name: name} }
+
+// realtimeNS groups the realtime hub. Subscribers connect over WebSocket at the
+// Canvas route /realtime/<name>; a function fans messages to them with
+// drift.Backbone.Realtime.Channel(name).Publish(msg).
+type realtimeNS struct{}
+
+// Channel returns a handle to a realtime channel for server-side publishing.
+func (realtimeNS) Channel(name string) RealtimeChannel { return RealtimeChannel{name: name} }
+
+// keyAuthNS / vaultNS are defined here so backboneNS compiles; their methods
+// live in the KeyAuth / Vault sections below.
+type keyAuthNS struct{}
+type vaultNS struct{}
+
 // --- Secret ---
 
 type secretNS struct{}
-
-// Secret provides access to Backbone secrets.
-var Secret secretNS
 
 // Get returns the value of the named secret.
 //
@@ -504,9 +515,6 @@ func (secretNS) Delete(name string) error {
 
 type cacheNS struct{}
 
-// Cache provides access to the Backbone key-value cache.
-var Cache cacheNS
-
 func (cacheNS) Get(key string) ([]byte, error) {
 	return callBackbone("GET", "cache/get?key="+url.QueryEscape(key), nil)
 }
@@ -531,9 +539,6 @@ func (cacheNS) Del(key string) error {
 // --- NoSQL ---
 
 type nosqlNS struct{}
-
-// NoSQL provides access to Backbone NoSQL document collections.
-var NoSQL nosqlNS
 
 type collectionHandle struct{ name string }
 
@@ -613,11 +618,6 @@ func (c collectionHandle) Drop() error {
 
 type queueHandle struct{ name string }
 
-// Queue returns a handle to a Backbone message queue.
-func Queue(name string) queueHandle {
-	return queueHandle{name: name}
-}
-
 func (q queueHandle) Push(body any) error {
 	_, err := callBackbone("POST", "queue/push", map[string]any{
 		"queue": q.name,
@@ -635,9 +635,6 @@ func (q queueHandle) Pop() (json.RawMessage, error) {
 // --- Blob ---
 
 type blobNS struct{}
-
-// Blob provides access to Backbone binary object storage.
-var Blob blobNS
 
 // splitBucketKey turns a path-shaped name ("submissions/sub-X/file.pdf")
 // into (bucket, key) so the platform's bucket+key blob protocol works
@@ -697,9 +694,6 @@ func callBackboneRaw(method, path string, data []byte, contentType string) error
 
 type lockNS struct{}
 
-// Lock provides access to Backbone distributed locks.
-var Lock lockNS
-
 func (lockNS) Acquire(name string, ttlSeconds int) (string, error) {
 	resp, err := callBackbone("POST", "lock/acquire", map[string]any{
 		"name": name,
@@ -723,6 +717,231 @@ func (lockNS) Release(name, token string) error {
 		"token": token,
 	})
 	return err
+}
+
+// --- Realtime ---
+
+// Realtime has two halves. The CLIENT half is a WebSocket: a browser (or any
+// WS client) connects to the Canvas route /realtime/<name> and receives every
+// message published to that channel. The SERVER half is this: a function calls
+// drift.Backbone.Realtime.Channel(name).Publish(msg) to fan a message out to all
+// of those subscribers — the primitive for live, server-pushed UIs (telemetry
+// streams, job progress, notifications).
+
+// RealtimeChannel is a server-side realtime channel handle. Construct it with
+// drift.Backbone.Realtime.Channel(name).
+type RealtimeChannel struct{ name string }
+
+// Publish delivers msg — any JSON-serializable value — to every subscriber
+// currently connected to the channel, and returns how many received it. A
+// publish to a channel with no subscribers is a no-op that returns 0; callers
+// that don't care about delivery can ignore both returns.
+func (c RealtimeChannel) Publish(msg any) (int, error) {
+	resp, err := callBackbone("POST", "realtime/publish", map[string]any{
+		"channel": c.name,
+		"message": msg,
+	})
+	if err != nil {
+		return 0, err
+	}
+	var out struct {
+		Recipients int `json:"recipients"`
+	}
+	if len(resp) > 0 {
+		_ = json.Unmarshal(resp, &out)
+	}
+	return out.Recipients, nil
+}
+
+// Presence reports how many subscribers are currently connected to the channel
+// (e.g. "N browsers watching this dashboard").
+func (c RealtimeChannel) Presence() (int, error) {
+	resp, err := callBackbone("GET", "realtime/presence?channel="+url.QueryEscape(c.name), nil)
+	if err != nil {
+		return 0, err
+	}
+	var out struct {
+		Present int `json:"present"`
+	}
+	if len(resp) > 0 {
+		_ = json.Unmarshal(resp, &out)
+	}
+	return out.Present, nil
+}
+
+// --- KeyAuth (Backbone.KeyAuth) ---
+//
+// Passwordless device-key auth (Ed25519). The client holds a keypair; the uid
+// IS its public key — no accounts, no passwords, no email. Challenge mints a
+// one-time nonce; the client signs the canonical {domain,nonce,pubkey}; Verify
+// checks the signature and issues THIS slice's session JWT (sub = pubkey). The
+// slice stores nothing about the user — it just verifies a signature. The
+// client half (keygen + signing + recovery-phrase derivation) is a small
+// browser library; see the @ondrift/keyauth memo.
+
+// Challenge returns a one-time login nonce for the given Ed25519 public key
+// (32-byte hex). Single-use, short-TTL, cache-backed in the slice.
+func (keyAuthNS) Challenge(pubkey string) (string, error) {
+	resp, err := callBackbone("POST", "keyauth/challenge", map[string]any{"pubkey": pubkey})
+	if err != nil {
+		return "", err
+	}
+	var out struct {
+		Nonce string `json:"nonce"`
+	}
+	if err := json.Unmarshal(resp, &out); err != nil {
+		return "", err
+	}
+	return out.Nonce, nil
+}
+
+// Verify checks the client's signature over the canonical {domain,nonce,pubkey}
+// and, on success, returns this slice's session JWT (sub = the pubkey). `domain`
+// namespaces the signature to your app (e.g. "myapp-auth-v1") so a signature for
+// one app/slice can't be replayed at another — the client must sign the same
+// domain. A bad/expired/absent challenge or a bad signature returns an error.
+func (keyAuthNS) Verify(pubkey, sig, domain string) (string, error) {
+	resp, err := callBackbone("POST", "keyauth/verify", map[string]any{
+		"pubkey": pubkey, "sig": sig, "domain": domain,
+	})
+	if err != nil {
+		return "", err
+	}
+	var out struct {
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal(resp, &out); err != nil {
+		return "", err
+	}
+	return out.Token, nil
+}
+
+// --- Vault (Backbone.Vault) ---
+//
+// Zero-knowledge recovery store: opaque, user-scoped, append-only. The client
+// encrypts the blob under a key derived from its recovery phrase (which the
+// slice NEVER sees), so Drift stores the backup but cannot read it. Scoped to a
+// uid the caller supplies — typically the authenticated KeyAuth pubkey. Backed
+// by NoSQL; uses the `keyvault` collection (declare it in your Driftfile).
+
+const vaultCollection = "keyvault"
+
+// Put appends an opaque encrypted backup blob for uid. Append-only (a new
+// version each call); Get returns the newest.
+func (vaultNS) Put(uid string, blob any) error {
+	_, err := Backbone.NoSQL.Collection(vaultCollection).Insert(map[string]any{
+		"_id":        fmt.Sprintf("%s:%d", uid, time.Now().UnixNano()),
+		"user_id":    uid,
+		"blob":       blob,
+		"updated_at": time.Now().Unix(),
+	})
+	return err
+}
+
+// Get returns the most recent backup blob for uid, or nil if none exists.
+func (vaultNS) Get(uid string) (json.RawMessage, error) {
+	rows, err := Backbone.NoSQL.Collection(vaultCollection).List(map[string]string{"user_id": uid})
+	if err != nil {
+		return nil, err
+	}
+	var bestAt int64 = -1
+	var best json.RawMessage
+	for _, r := range rows {
+		var d struct {
+			Blob      json.RawMessage `json:"blob"`
+			UpdatedAt int64           `json:"updated_at"`
+		}
+		if json.Unmarshal(r, &d) == nil && d.UpdatedAt >= bestAt {
+			bestAt, best = d.UpdatedAt, d.Blob
+		}
+	}
+	return best, nil
+}
+
+// --- Slice-to-slice linking ---
+
+// Slice returns a client for calling another slice you're LINKED to (e.g. an
+// app slice → your own observability slice). Establish the link first with
+// `drift slice link add <name>` (same-user). The call travels in-cluster — no
+// public hop — and carries this slice's identity so the callee can authorize it
+// (see CallerSlice). Returns an error at call time if no link exists.
+//
+//	resp, err := drift.Slice("c12").Post("/api/events", batch)
+func Slice(name string) SliceClient { return SliceClient{name: name} }
+
+// SliceClient calls a linked slice. Construct it with Slice(name).
+type SliceClient struct{ name string }
+
+// resolveURL builds the absolute in-cluster URL for path. The platform injects
+// the linked slice's internal base URL as DRIFT_LINK_<NAME>_URL when the link
+// is created; its absence means "not linked".
+func (s SliceClient) resolveURL(path string) (string, error) {
+	base := os.Getenv("DRIFT_LINK_" + linkEnvName(s.name) + "_URL")
+	if base == "" {
+		return "", fmt.Errorf("drift: not linked to slice %q — run `drift slice link add %s`", s.name, s.name)
+	}
+	return strings.TrimRight(base, "/") + "/" + strings.TrimPrefix(path, "/"), nil
+}
+
+// Request calls the linked slice with a raw body. The X-Drift-Slice identity
+// header is injected automatically; caller headers override it only if they set
+// the same key. A non-existent link surfaces as an error before any network I/O.
+func (s SliceClient) Request(method, path string, headers map[string]string, body []byte) (*HTTPResponse, error) {
+	url, err := s.resolveURL(path)
+	if err != nil {
+		return nil, err
+	}
+	h := map[string]string{"X-Drift-Slice": os.Getenv("DRIFT_SLICE")}
+	for k, v := range headers {
+		h[k] = v
+	}
+	return HTTPRequest(method, url, h, body)
+}
+
+// Get issues a GET to the linked slice.
+func (s SliceClient) Get(path string) (*HTTPResponse, error) {
+	return s.Request("GET", path, nil, nil)
+}
+
+// Post JSON-encodes body and POSTs it to the linked slice.
+func (s SliceClient) Post(path string, body any) (*HTTPResponse, error) {
+	b, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("drift: marshal slice request body: %w", err)
+	}
+	return s.Request("POST", path, map[string]string{"Content-Type": "application/json"}, b)
+}
+
+// CallerSlice returns the name of the linked slice that made this request, or ""
+// if the request did not arrive over a slice-to-slice link. Trustworthy within
+// the same owner (and, later, the same Team): the NetworkPolicy guarantees the
+// only slices that can reach this one are the ones you linked, so the asserted
+// identity can only be one of your own slices.
+func CallerSlice(req Request) string {
+	for k, v := range req.Headers {
+		if strings.EqualFold(k, "X-Drift-Slice") {
+			return v
+		}
+	}
+	return ""
+}
+
+// linkEnvName upper-cases a slice name and replaces every non-alphanumeric byte
+// with "_" — mirrors the operator's envSafe so DRIFT_LINK_<NAME>_URL matches.
+func linkEnvName(name string) string {
+	var b strings.Builder
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		switch {
+		case c >= 'a' && c <= 'z':
+			b.WriteByte(c - 32)
+		case (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'):
+			b.WriteByte(c)
+		default:
+			b.WriteByte('_')
+		}
+	}
+	return b.String()
 }
 
 // ─── Environment ────────────────────────────────────────────────────────────
@@ -1090,9 +1309,6 @@ func (e *JWTError) Error() string {
 
 type jwtNS struct{}
 
-// JWT provides access to the slice's signed JWT primitive.
-var JWT jwtNS
-
 // Issue signs a JWT with the slice's HS256 JKey and returns the encoded
 // token. Iat/Iss/Jti are auto-populated when zero; Exp is required (Issue
 // returns an error if it's missing or in the past).
@@ -1236,13 +1452,6 @@ func (jwtNS) SliceID() string {
 // SQLDB is the per-database handle returned by SQL().
 type SQLDB struct {
 	name string
-}
-
-// SQL opens (lazily; the slice handles the actual file open) a handle
-// to the named SQLite database. The name must already be declared in
-// the Driftfile under `slice.backbone.sql[]`.
-func SQL(name string) SQLDB {
-	return SQLDB{name: name}
 }
 
 // SQLResult is the shape returned by Execute.

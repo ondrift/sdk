@@ -2,9 +2,13 @@
 #
 # This single-file SDK provides:
 #   - Drift.run(handler): Entry point that dispatches to deployed or local mode.
-#   - Backbone helpers: Secret, Cache, Nosql, Queue, Blob, Lock.
+#   - Drift::Backbone — the B of the sacred A·B·C triad; the SOLE entrypoint for
+#     every STATE primitive: Secret, Cache, Nosql, queue, Blob, Lock, JWT, sql,
+#     Realtime, KeyAuth, Vault. (There is no top-level Drift::Secret etc. — go
+#     through Drift::Backbone.)
 #   - Drift.log(msg): Writes to stderr (captured by the runner as function logs).
 #   - Drift.http_request(): Outbound HTTP from within a function.
+#   - Drift.slice(name) / Drift.caller_slice(req): slice-to-slice linking.
 #
 # All backbone helpers use only stdlib (net/http) -- zero external dependencies.
 
@@ -100,65 +104,21 @@ module Drift
     @backbone_url ||= ENV['BACKBONE_URL'] || ''
   end
 
-  # _backbone_http issues a request to the backbone over either a Unix Domain
-  # Socket (BACKBONE_URL=unix:///path — the slice default: lower latency, no TCP
-  # surface) or TCP (http://host:port, used by `drift atomic run`). Returns
-  # [status_code, body]. Stdlib only — Socket for UDS, Net::HTTP for TCP.
+  # _backbone_http issues a request to the backbone over TCP
+  # (BACKBONE_URL=http://host:port). Returns [status_code, body].
+  # Stdlib only — Net::HTTP.
   def self._backbone_http(method, path, body, content_type)
     base = _get_backbone_url
-    if base.start_with?('unix://')
-      _backbone_uds(base.sub('unix://', ''), method, "/#{path}", body, content_type)
-    else
-      uri = URI("#{base}/#{path}")
-      http = Net::HTTP.new(uri.host, uri.port)
-      http.use_ssl = uri.scheme == 'https'
-      req = Net::HTTP.const_get(method.capitalize).new(uri)
-      if body
-        req['Content-Type'] = content_type
-        req.body = body
-      end
-      resp = http.request(req)
-      [resp.code.to_i, resp.body]
+    uri = URI("#{base}/#{path}")
+    http = Net::HTTP.new(uri.host, uri.port)
+    http.use_ssl = uri.scheme == 'https'
+    req = Net::HTTP.const_get(method.capitalize).new(uri)
+    if body
+      req['Content-Type'] = content_type
+      req.body = body
     end
-  end
-
-  def self._backbone_uds(sock_path, method, path, body, content_type)
-    sock = UNIXSocket.new(sock_path)
-    begin
-      out = +"#{method} #{path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n"
-      out << "Content-Type: #{content_type}\r\nContent-Length: #{body.bytesize}\r\n" if body
-      out << "\r\n"
-      out << body if body
-      sock.write(out)
-      raw = sock.read # Connection: close → server closes after the response
-    ensure
-      sock.close
-    end
-    _parse_http(raw || ''.b)
-  end
-
-  # _parse_http splits a raw HTTP/1.1 response into [status_code, body],
-  # decoding Transfer-Encoding: chunked when present (Content-Length otherwise).
-  def self._parse_http(raw)
-    head, _, rest = raw.partition("\r\n\r\n")
-    lines = head.split("\r\n")
-    status = (lines[0].to_s.split(' ')[1] || '0').to_i
-    if lines.any? { |l| d = l.downcase; d.start_with?('transfer-encoding:') && d.include?('chunked') }
-      body = ''.b
-      buf = rest
-      loop do
-        nl = buf.index("\r\n")
-        break unless nl
-        size = buf[0...nl].to_i(16)
-        break if size <= 0
-        start = nl + 2
-        body << buf[start, size].to_s
-        buf = buf[(start + size + 2)..] || ''
-      end
-      [status, body]
-    else
-      [status, rest]
-    end
+    resp = http.request(req)
+    [resp.code.to_i, resp.body]
   end
 
   def self._call(method, path, body = nil)
@@ -283,188 +243,10 @@ module Drift
     nil
   end
 
-  # ---------------------------------------------------------------------------
-  # Secret
-  # ---------------------------------------------------------------------------
-
-  module Secret
-    # Read order:
-    #   1. DRIFT_SECRET_<NAME> env var — set by the runner from the
-    #      function's @atomic-secrets allowlist. This is the only path
-    #      that works in production: backbone /secret/get is SAT-guarded
-    #      and the subprocess does not have the SAT.
-    #   2. HTTP fallback — local-dev (`drift atomic run`) only. In
-    #      production the call returns 401.
-    def self.get(name)
-      env_val = ENV["DRIFT_SECRET_#{name.upcase}"]
-      return env_val unless env_val.nil?
-      resp = Drift._call('GET', "secret/get?name=#{URI.encode_www_form_component(name)}")
-      resp.is_a?(String) ? resp : (resp ? JSON.generate(resp) : '')
-    end
-
-    def self.set(name, value)
-      Drift._call('POST', 'secret/set', { 'name' => name, 'value' => value })
-    end
-
-    def self.delete(name)
-      Drift._call('DELETE', "secret/delete?name=#{URI.encode_www_form_component(name)}")
-    end
-  end
-
-  # ---------------------------------------------------------------------------
-  # Cache
-  # ---------------------------------------------------------------------------
-
-  module Cache
-    def self.get(key)
-      Drift._call('GET', "cache/get?key=#{URI.encode_www_form_component(key)}")
-    end
-
-    def self.set(key, value, ttl:)
-      payload = { 'key' => key, 'value' => value }
-      payload['ttl'] = ttl if ttl > 0
-      Drift._call('POST', 'cache/set', payload)
-    end
-
-    def self.delete(key)
-      Drift._call('DELETE', "cache/del?key=#{URI.encode_www_form_component(key)}")
-    end
-  end
-
-  # ---------------------------------------------------------------------------
-  # NoSQL
-  # ---------------------------------------------------------------------------
-
-  module Nosql
-    def self.collection(name)
-      Collection.new(name)
-    end
-
-    class Collection
-      def initialize(name)
-        @name = name
-      end
-
-      def insert(doc)
-        payload = { 'collection' => @name }
-        if doc.is_a?(Hash)
-          payload.merge!(doc)
-        else
-          payload['data'] = doc
-        end
-        resp = Drift._call('POST', 'write', payload)
-        resp.is_a?(Hash) ? (resp['key'] || '') : ''
-      end
-
-      def read(key)
-        Drift._call('GET', "read?collection=#{URI.encode_www_form_component(@name)}&key=#{URI.encode_www_form_component(key)}")
-      end
-
-      def get(id)
-        path = "nosql/list?collection=#{URI.encode_www_form_component(@name)}&field=_id&value=#{URI.encode_www_form_component(id)}"
-        rows = Drift._call('GET', path)
-        rows = rows.is_a?(Array) ? rows : []
-        rows.first
-      end
-
-      def delete(key)
-        Drift._call('POST', "nosql/delete?collection=#{URI.encode_www_form_component(@name)}&key=#{URI.encode_www_form_component(key)}")
-      end
-
-      def list(filter = nil)
-        path = "nosql/list?collection=#{URI.encode_www_form_component(@name)}"
-        if filter
-          filter.each do |k, v|
-            path += "&field=#{URI.encode_www_form_component(k)}&value=#{URI.encode_www_form_component(v)}"
-          end
-        end
-        resp = Drift._call('GET', path)
-        resp.is_a?(Array) ? resp : []
-      end
-
-      def drop
-        Drift._call('POST', "nosql/drop?collection=#{URI.encode_www_form_component(@name)}")
-      end
-    end
-  end
-
-  # ---------------------------------------------------------------------------
-  # Queue
-  # ---------------------------------------------------------------------------
-
-  def self.queue(name)
-    QueueHandle.new(name)
-  end
-
-  class QueueHandle
-    def initialize(name)
-      @name = name
-    end
-
-    def push(body)
-      Drift._call('POST', 'queue/push', { 'queue' => @name, 'body' => body })
-    end
-
-    def pop
-      Drift._call('POST', 'queue/pop', { 'queue' => @name })
-    end
-  end
-
-  # ---------------------------------------------------------------------------
-  # Blob
-  # ---------------------------------------------------------------------------
-
-  module Blob
-    def self._split(name)
-      i = name.index('/')
-      i ? [name[0...i], name[(i + 1)..]] : ['default', name]
-    end
-
-    def self.put(name, data, content_type: nil)
-      bucket, key = _split(name)
-      path = "blob/put?bucket=#{URI.encode_www_form_component(bucket)}&key=#{URI.encode_www_form_component(key)}"
-      bytes = data.is_a?(String) ? data : data.to_s
-      Drift._call_raw('POST', path, bytes, content_type || 'application/octet-stream')
-    end
-
-    def self.get(name)
-      bucket, key = _split(name)
-      return nil if Drift._get_backbone_url.empty?
-      path = "blob/get?bucket=#{URI.encode_www_form_component(bucket)}&key=#{URI.encode_www_form_component(key)}"
-      code, body = Drift._backbone_http('GET', path, nil, nil)
-      (code && code >= 200 && code < 300) ? body : nil
-    end
-  end
-
-  # ---------------------------------------------------------------------------
-  # Lock
-  # ---------------------------------------------------------------------------
-
-  module Lock
-    def self.acquire(name, ttl:)
-      resp = Drift._call('POST', 'lock/acquire', { 'name' => name, 'ttl' => ttl })
-      (resp || {})['token'] || ''
-    end
-
-    def self.release(name, token)
-      Drift._call('POST', 'lock/release', { 'name' => name, 'token' => token })
-    end
-  end
-
-  # ---------------------------------------------------------------------------
-  # JWT primitive
-  # ---------------------------------------------------------------------------
-  #
-  # HS256 minting + verification, signed with the slice's per-slice JKey. The
-  # signing key never leaves the slice's backbone process; all operations flow
-  # through loopback HTTP to backbone /jwt/{sign,verify,slice-id}.
-  #
-  # Design: internal/todo/slice-jwt-primitive.md.
-
-  # Raised by Drift::JWT.verify on validation failure. `reason` is one of the
-  # stable wire strings: malformed, bad_signature, expired, not_yet_valid,
-  # wrong_algorithm, wrong_issuer, wrong_audience, invalid_claims,
-  # missing_exp, internal_error.
+  # Raised by Drift::Backbone::JWT.verify on validation failure. `reason` is one
+  # of the stable wire strings: malformed, bad_signature, expired, not_yet_valid,
+  # wrong_algorithm, wrong_issuer, wrong_audience, invalid_claims, missing_exp,
+  # internal_error. Kept top-level (it is an error type, not a state entrypoint).
   class JWTError < StandardError
     attr_reader :reason
     def initialize(reason)
@@ -473,40 +255,322 @@ module Drift
     end
   end
 
-  module JWT
-    # Sign a JWT with the slice's HS256 JKey. `exp` is required; `iat`,
-    # `iss`, and `jti` are auto-set when nil. `custom` is a hash of
-    # app-specific claims that the platform never inspects.
-    def self.issue(sub: nil, exp: nil, iat: nil, nbf: nil, iss: nil, aud: nil, jti: nil, custom: nil)
-      body = {}
-      body['sub']    = sub    unless sub.nil?
-      body['exp']    = exp    unless exp.nil?
-      body['iat']    = iat    unless iat.nil?
-      body['nbf']    = nbf    unless nbf.nil?
-      body['iss']    = iss    unless iss.nil?
-      body['aud']    = aud    unless aud.nil?
-      body['jti']    = jti    unless jti.nil?
-      body['custom'] = custom unless custom.nil?
-      resp = Drift._call('POST', 'jwt/sign', body)
-      (resp || {})['token']
+  # ===========================================================================
+  # Backbone — the B of the sacred A·B·C triad. The SOLE entrypoint for every
+  # state primitive. Use Drift::Backbone::Secret, Drift::Backbone.queue(...),
+  # Drift::Backbone::Realtime, etc. — nothing stateful lives at the top level.
+  # ===========================================================================
+
+  module Backbone
+
+    # -------------------------------------------------------------------------
+    # Secret
+    # -------------------------------------------------------------------------
+
+    module Secret
+      # Read order:
+      #   1. DRIFT_SECRET_<NAME> env var — set by the runner from the
+      #      function's @atomic-secrets allowlist. This is the only path
+      #      that works in production: backbone /secret/get is SAT-guarded
+      #      and the subprocess does not have the SAT.
+      #   2. HTTP fallback — local-dev (`drift atomic run`) only. In
+      #      production the call returns 401.
+      def self.get(name)
+        env_val = ENV["DRIFT_SECRET_#{name.upcase}"]
+        return env_val unless env_val.nil?
+        resp = Drift._call('GET', "secret/get?name=#{URI.encode_www_form_component(name)}")
+        resp.is_a?(String) ? resp : (resp ? JSON.generate(resp) : '')
+      end
+
+      def self.set(name, value)
+        Drift._call('POST', 'secret/set', { 'name' => name, 'value' => value })
+      end
+
+      def self.delete(name)
+        Drift._call('DELETE', "secret/delete?name=#{URI.encode_www_form_component(name)}")
+      end
     end
 
-    # Validate a token. Returns the parsed claims hash on success;
-    # raises Drift::JWTError on validation failure.
-    def self.verify(token, audience: nil, allowed_issuer: nil)
-      body = { 'token' => token }
-      body['audience']       = audience       unless audience.nil?
-      body['allowed_issuer'] = allowed_issuer unless allowed_issuer.nil?
-      resp = Drift._call('POST', 'jwt/verify', body)
-      raise JWTError.new('internal_error') unless resp.is_a?(Hash)
-      raise JWTError.new(resp['reason'] || 'internal_error') unless resp['valid']
-      resp['claims'] || {}
+    # -------------------------------------------------------------------------
+    # Cache
+    # -------------------------------------------------------------------------
+
+    module Cache
+      def self.get(key)
+        Drift._call('GET', "cache/get?key=#{URI.encode_www_form_component(key)}")
+      end
+
+      def self.set(key, value, ttl:)
+        payload = { 'key' => key, 'value' => value }
+        payload['ttl'] = ttl if ttl > 0
+        Drift._call('POST', 'cache/set', payload)
+      end
+
+      def self.delete(key)
+        Drift._call('DELETE', "cache/del?key=#{URI.encode_www_form_component(key)}")
+      end
     end
 
-    # The slice's auto-set issuer string ("drift-slice-<user>-<slice>").
-    def self.slice_id
-      resp = Drift._call('GET', 'jwt/slice-id')
-      resp.is_a?(Hash) ? (resp['slice_id'] || '') : ''
+    # -------------------------------------------------------------------------
+    # NoSQL
+    # -------------------------------------------------------------------------
+
+    module Nosql
+      def self.collection(name)
+        Collection.new(name)
+      end
+
+      class Collection
+        def initialize(name)
+          @name = name
+        end
+
+        def insert(doc)
+          payload = { 'collection' => @name }
+          if doc.is_a?(Hash)
+            payload.merge!(doc)
+          else
+            payload['data'] = doc
+          end
+          resp = Drift._call('POST', 'write', payload)
+          resp.is_a?(Hash) ? (resp['key'] || '') : ''
+        end
+
+        def read(key)
+          Drift._call('GET', "read?collection=#{URI.encode_www_form_component(@name)}&key=#{URI.encode_www_form_component(key)}")
+        end
+
+        def get(id)
+          path = "nosql/list?collection=#{URI.encode_www_form_component(@name)}&field=_id&value=#{URI.encode_www_form_component(id)}"
+          rows = Drift._call('GET', path)
+          rows = rows.is_a?(Array) ? rows : []
+          rows.first
+        end
+
+        def delete(key)
+          Drift._call('POST', "nosql/delete?collection=#{URI.encode_www_form_component(@name)}&key=#{URI.encode_www_form_component(key)}")
+        end
+
+        def list(filter = nil)
+          path = "nosql/list?collection=#{URI.encode_www_form_component(@name)}"
+          if filter
+            filter.each do |k, v|
+              path += "&field=#{URI.encode_www_form_component(k)}&value=#{URI.encode_www_form_component(v)}"
+            end
+          end
+          resp = Drift._call('GET', path)
+          resp.is_a?(Array) ? resp : []
+        end
+
+        def drop
+          Drift._call('POST', "nosql/drop?collection=#{URI.encode_www_form_component(@name)}")
+        end
+      end
+    end
+
+    # -------------------------------------------------------------------------
+    # Queue
+    # -------------------------------------------------------------------------
+
+    def self.queue(name)
+      QueueHandle.new(name)
+    end
+
+    class QueueHandle
+      def initialize(name)
+        @name = name
+      end
+
+      def push(body)
+        Drift._call('POST', 'queue/push', { 'queue' => @name, 'body' => body })
+      end
+
+      def pop
+        Drift._call('POST', 'queue/pop', { 'queue' => @name })
+      end
+    end
+
+    # -------------------------------------------------------------------------
+    # Blob
+    # -------------------------------------------------------------------------
+
+    module Blob
+      def self._split(name)
+        i = name.index('/')
+        i ? [name[0...i], name[(i + 1)..]] : ['default', name]
+      end
+
+      def self.put(name, data, content_type: nil)
+        bucket, key = _split(name)
+        path = "blob/put?bucket=#{URI.encode_www_form_component(bucket)}&key=#{URI.encode_www_form_component(key)}"
+        bytes = data.is_a?(String) ? data : data.to_s
+        Drift._call_raw('POST', path, bytes, content_type || 'application/octet-stream')
+      end
+
+      def self.get(name)
+        bucket, key = _split(name)
+        return nil if Drift._get_backbone_url.empty?
+        path = "blob/get?bucket=#{URI.encode_www_form_component(bucket)}&key=#{URI.encode_www_form_component(key)}"
+        code, body = Drift._backbone_http('GET', path, nil, nil)
+        (code && code >= 200 && code < 300) ? body : nil
+      end
+    end
+
+    # -------------------------------------------------------------------------
+    # Lock
+    # -------------------------------------------------------------------------
+
+    module Lock
+      def self.acquire(name, ttl:)
+        resp = Drift._call('POST', 'lock/acquire', { 'name' => name, 'ttl' => ttl })
+        (resp || {})['token'] || ''
+      end
+
+      def self.release(name, token)
+        Drift._call('POST', 'lock/release', { 'name' => name, 'token' => token })
+      end
+    end
+
+    # -------------------------------------------------------------------------
+    # JWT primitive
+    # -------------------------------------------------------------------------
+    #
+    # HS256 minting + verification, signed with the slice's per-slice JKey. The
+    # signing key never leaves the slice's backbone process; all operations flow
+    # through loopback HTTP to backbone /jwt/{sign,verify,slice-id}.
+    #
+    # Design: internal/todo/slice-jwt-primitive.md.
+
+    module JWT
+      # Sign a JWT with the slice's HS256 JKey. `exp` is required; `iat`,
+      # `iss`, and `jti` are auto-set when nil. `custom` is a hash of
+      # app-specific claims that the platform never inspects.
+      def self.issue(sub: nil, exp: nil, iat: nil, nbf: nil, iss: nil, aud: nil, jti: nil, custom: nil)
+        body = {}
+        body['sub']    = sub    unless sub.nil?
+        body['exp']    = exp    unless exp.nil?
+        body['iat']    = iat    unless iat.nil?
+        body['nbf']    = nbf    unless nbf.nil?
+        body['iss']    = iss    unless iss.nil?
+        body['aud']    = aud    unless aud.nil?
+        body['jti']    = jti    unless jti.nil?
+        body['custom'] = custom unless custom.nil?
+        resp = Drift._call('POST', 'jwt/sign', body)
+        (resp || {})['token']
+      end
+
+      # Validate a token. Returns the parsed claims hash on success;
+      # raises Drift::JWTError on validation failure.
+      def self.verify(token, audience: nil, allowed_issuer: nil)
+        body = { 'token' => token }
+        body['audience']       = audience       unless audience.nil?
+        body['allowed_issuer'] = allowed_issuer unless allowed_issuer.nil?
+        resp = Drift._call('POST', 'jwt/verify', body)
+        raise JWTError.new('internal_error') unless resp.is_a?(Hash)
+        raise JWTError.new(resp['reason'] || 'internal_error') unless resp['valid']
+        resp['claims'] || {}
+      end
+
+      # The slice's auto-set issuer string ("drift-slice-<user>-<slice>").
+      def self.slice_id
+        resp = Drift._call('GET', 'jwt/slice-id')
+        resp.is_a?(Hash) ? (resp['slice_id'] || '') : ''
+      end
+    end
+
+    # -------------------------------------------------------------------------
+    # Realtime — pub/sub fan-out over the slice's Canvas WebSocket hub.
+    # -------------------------------------------------------------------------
+    #
+    # Subscribers connect over WebSocket at the Canvas route /realtime/<name>;
+    # publish fans a message out to every connected subscriber.
+
+    module Realtime
+      def self.channel(name)
+        Channel.new(name)
+      end
+
+      class Channel
+        def initialize(name)
+          @name = name
+        end
+
+        # Publish a message to every subscriber. Returns the recipient count.
+        def publish(message)
+          resp = Drift._call('POST', 'realtime/publish', { 'channel' => @name, 'message' => message })
+          resp.is_a?(Hash) ? (resp['recipients'] || 0) : 0
+        end
+
+        # The number of subscribers currently connected to this channel.
+        def presence
+          resp = Drift._call('GET', "realtime/presence?channel=#{URI.encode_www_form_component(@name)}")
+          resp.is_a?(Hash) ? (resp['present'] || 0) : 0
+        end
+      end
+    end
+
+    # -------------------------------------------------------------------------
+    # KeyAuth — passwordless Ed25519 device-key auth.
+    # -------------------------------------------------------------------------
+    #
+    # uid = the public key. `challenge` mints a one-time nonce; the client signs
+    # the canonical {domain,nonce,pubkey}; `verify` checks the signature and
+    # returns THIS slice's session JWT. `domain` namespaces the signature per
+    # app (replay-safety).
+
+    module KeyAuth
+      def self.challenge(pubkey)
+        resp = Drift._call('POST', 'keyauth/challenge', { 'pubkey' => pubkey })
+        resp.is_a?(Hash) ? (resp['nonce'] || '') : ''
+      end
+
+      def self.verify(pubkey, sig, domain)
+        resp = Drift._call('POST', 'keyauth/verify', { 'pubkey' => pubkey, 'sig' => sig, 'domain' => domain })
+        resp.is_a?(Hash) ? (resp['token'] || '') : ''
+      end
+    end
+
+    # -------------------------------------------------------------------------
+    # Vault — zero-knowledge recovery store (Layer B).
+    # -------------------------------------------------------------------------
+    #
+    # User-scoped, append-only, opaque. The client encrypts the blob under a key
+    # the slice never sees. Backed by the `keyvault` NoSQL collection (declare it
+    # in your Driftfile).
+
+    module Vault
+      def self.put(uid, blob)
+        nanos = Process.clock_gettime(Process::CLOCK_MONOTONIC, :nanosecond)
+        Nosql.collection('keyvault').insert({
+          '_id' => "#{uid}:#{nanos}",
+          'user_id' => uid,
+          'blob' => blob,
+          'updated_at' => Time.now.to_i,
+        })
+      end
+
+      def self.get(uid)
+        rows = Nosql.collection('keyvault').list({ 'user_id' => uid })
+        best_at = -1
+        best = nil
+        rows.each do |r|
+          next unless r.is_a?(Hash)
+          at = r['updated_at'] || 0
+          if at >= best_at
+            best_at = at
+            best = r['blob']
+          end
+        end
+        best
+      end
+    end
+
+    # -------------------------------------------------------------------------
+    # SQL — per-slice SQLite databases.
+    # -------------------------------------------------------------------------
+
+    def self.sql(name)
+      Drift::SqlDb.new(name)
     end
   end
 
@@ -672,22 +736,78 @@ module Drift
     end
   end
 
-end
+  # ---------------------------------------------------------------------------
+  # Slice-to-slice linking (top-level; the seed of a future "D" pillar)
+  # ---------------------------------------------------------------------------
+  #
+  # Not Backbone — this is inter-slice networking, parked at the top level until
+  # the fourth pillar lands.
 
-module Drift
+  def self._link_env_name(name)
+    'DRIFT_LINK_' + name.upcase.gsub(/[^A-Z0-9]/, '_') + '_URL'
+  end
+
+  class SliceClient
+    def initialize(name)
+      @name = name
+    end
+
+    def _url(path)
+      base = ENV[Drift._link_env_name(@name)]
+      if base.nil? || base.empty?
+        raise "drift: not linked to slice \"#{@name}\" — run `drift slice link add #{@name}`"
+      end
+      base.chomp('/') + '/' + path.to_s.sub(%r{\A/}, '')
+    end
+
+    def request(method, path, headers: {}, body: nil)
+      h = { 'X-Drift-Slice' => (ENV['DRIFT_SLICE'] || '') }.merge(headers || {})
+      Drift.http_request(method, _url(path), h, body)
+    end
+
+    def get(path)
+      request('GET', path)
+    end
+
+    def post(path, body = nil)
+      request('POST', path,
+              headers: { 'Content-Type' => 'application/json' },
+              body: body.nil? ? nil : JSON.generate(body))
+    end
+  end
+
+  # A client for another slice you've LINKED to (`drift slice link`). The call
+  # travels in-cluster and carries this slice's identity (X-Drift-Slice).
+  def self.slice(name)
+    SliceClient.new(name)
+  end
+
+  # The linked slice that called this request, or "" if not via a link.
+  def self.caller_slice(req)
+    headers = (req || {})['headers'] || {}
+    headers.each { |k, v| return v if k.to_s.downcase == 'x-drift-slice' }
+    ''
+  end
+
+  # An environment variable value ("" if unset).
+  def self.env(key)
+    ENV[key] || ''
+  end
 
   # ─── SQL ────────────────────────────────────────────────────────────────────
   #
-  # Per-slice SQLite databases. Wire shape: one JSON envelope per call
-  # ({db, sql, args, tx?}). See docs/memos/backbone-sql.md.
+  # Per-slice SQLite databases. Reached via Drift::Backbone.sql(name). Wire
+  # shape: one JSON envelope per call ({db, sql, args, tx?}).
+  # See docs/memos/backbone-sql.md.
   #
-  #   db = Drift.sql("clinic")
+  #   db = Drift::Backbone.sql("clinic")
   #   rows = db.query("SELECT * FROM appointments WHERE slot >= ?", ["2026-05-01"])
   #   res = db.execute("INSERT INTO appointments(...) VALUES(?, ?)", ["alice", "10:00"])
   #   db.transaction do |tx|
   #     tx.execute("UPDATE appointments SET status=? WHERE id=?", ["confirmed", 7])
   #   end
   #
+  # SqlDb/SqlTx are implementation classes — reach them through Backbone.sql.
 
   class SqlDb
     def initialize(name)
@@ -757,7 +877,4 @@ module Drift
     end
   end
 
-  def self.sql(name)
-    SqlDb.new(name)
-  end
 end

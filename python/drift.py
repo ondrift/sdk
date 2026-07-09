@@ -13,8 +13,10 @@ All backbone helpers use only stdlib (urllib.request) -- zero external dependenc
 import http.client
 import json
 import os
+import re
 import sys
 import threading
+import time
 import urllib.parse
 import urllib.request  # outbound user HTTP only — backbone uses http.client below
 import urllib.error
@@ -145,49 +147,14 @@ _conn_target = None  # tuple (host, port) — re-created if BACKBONE_URL changes
 _conn_lock = threading.Lock()
 
 
-class _UnixHTTPConnection(http.client.HTTPConnection):
-    """HTTPConnection that talks to a Unix Domain Socket instead of TCP.
-    Slice main injects BACKBONE_URL=unix:///tmp/drift-backbone.sock as
-    the default for in-process subprocess traffic; this class is the
-    Python-side decoder."""
-
-    def __init__(self, sock_path, timeout=30):
-        # Pass a dummy host — http.client uses it for the Host header
-        # but the connection itself goes through self.sock.
-        super().__init__("localhost", timeout=timeout)
-        self._sock_path = sock_path
-
-    def connect(self):
-        import socket
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.settimeout(self.timeout)
-        sock.connect(self._sock_path)
-        self.sock = sock
-
-
 def _ensure_conn(base_url):
     """Create or reuse a persistent backbone connection. Returns
     (connection, path_prefix). path_prefix is the URL path component
-    of BACKBONE_URL (usually empty for both http:// and unix://).
+    of BACKBONE_URL (usually empty).
 
-    Handles two URL shapes:
-      - http://host:port  → TCP HTTPConnection
-      - unix:///path/to/sock → UDS HTTPConnection (lower latency)
+    BACKBONE_URL is an http://host:port TCP URL.
     """
     global _conn, _conn_target
-    if base_url.startswith("unix://"):
-        sock_path = base_url[len("unix://"):]
-        target = ("unix", sock_path)
-        if _conn is None or _conn_target != target:
-            if _conn is not None:
-                try:
-                    _conn.close()
-                except Exception:
-                    pass
-            _conn = _UnixHTTPConnection(sock_path, timeout=30)
-            _conn_target = target
-        return _conn, ""
-
     parsed = urllib.parse.urlparse(base_url)
     host = parsed.hostname or "localhost"
     port = parsed.port or 80
@@ -891,3 +858,156 @@ def sql(name):
 # Capitalised alias for parity with other Drift SDKs that expose
 # `drift.SQL("name")` as the canonical entry point.
 SQL = sql
+
+
+# ---------------------------------------------------------------------------
+# Realtime / KeyAuth / Vault — backbone primitives (parity with the Go SDK)
+# ---------------------------------------------------------------------------
+
+class _RealtimeChannel:
+    """A realtime channel handle. Subscribers connect over WebSocket at the
+    Canvas route /realtime/<name>; publish() fans a message out to all of them."""
+
+    def __init__(self, name):
+        self.name = name
+
+    def publish(self, msg):
+        resp = _call("POST", "realtime/publish", {"channel": self.name, "message": msg})
+        return resp.get("recipients", 0) if isinstance(resp, dict) else 0
+
+    def presence(self):
+        resp = _call("GET", f"realtime/presence?channel={urllib.parse.quote(self.name)}")
+        return resp.get("present", 0) if isinstance(resp, dict) else 0
+
+
+class _RealtimeNS:
+    def channel(self, name):
+        return _RealtimeChannel(name)
+
+
+class _KeyAuthNS:
+    """Passwordless Ed25519 device-key auth. uid = the public key. challenge
+    mints a one-time nonce; the client signs the canonical {domain,nonce,pubkey};
+    verify checks the signature and returns this slice's session JWT."""
+
+    def challenge(self, pubkey):
+        resp = _call("POST", "keyauth/challenge", {"pubkey": pubkey})
+        return resp.get("nonce", "") if isinstance(resp, dict) else ""
+
+    def verify(self, pubkey, sig, domain):
+        resp = _call("POST", "keyauth/verify", {"pubkey": pubkey, "sig": sig, "domain": domain})
+        return resp.get("token", "") if isinstance(resp, dict) else ""
+
+
+class _VaultNS:
+    """Zero-knowledge recovery store: user-scoped, append-only, opaque. The
+    client encrypts the blob under a key the slice never sees. Backed by the
+    `keyvault` NoSQL collection (declare it in your Driftfile)."""
+
+    def put(self, uid, blob):
+        _CollectionHandle("keyvault").insert({
+            "_id": f"{uid}:{time.time_ns()}",
+            "user_id": uid,
+            "blob": blob,
+            "updated_at": int(time.time()),
+        })
+
+    def get(self, uid):
+        rows = _CollectionHandle("keyvault").list({"user_id": uid})
+        best_at, best = -1, None
+        for r in rows:
+            at = r.get("updated_at", 0) if isinstance(r, dict) else 0
+            if at >= best_at:
+                best_at = at
+                best = r.get("blob") if isinstance(r, dict) else None
+        return best
+
+
+# ---------------------------------------------------------------------------
+# Backbone — the B of the sacred A·B·C triad; sole entrypoint for state.
+#   drift.backbone.{secret,cache,nosql,queue,blob,lock,jwt,sql,realtime,
+#                   keyauth,vault}
+# ---------------------------------------------------------------------------
+
+class _Backbone:
+    def __init__(self):
+        self.secret = _SecretNS()
+        self.cache = _CacheNS()
+        self.nosql = _NoSQLNS()
+        self.blob = _BlobNS()
+        self.lock = _LockNS()
+        self.jwt = _JWTNS()
+        self.realtime = _RealtimeNS()
+        self.keyauth = _KeyAuthNS()
+        self.vault = _VaultNS()
+
+    def queue(self, name):
+        return _QueueHandle(name)
+
+    def sql(self, name):
+        return _SQLDB(name)
+
+
+backbone = _Backbone()
+
+
+# ---------------------------------------------------------------------------
+# Slice-to-slice linking (top-level; seed of a future "D")
+# ---------------------------------------------------------------------------
+
+def _link_env_name(name):
+    return "DRIFT_LINK_" + re.sub(r"[^A-Z0-9]", "_", name.upper()) + "_URL"
+
+
+class _SliceClient:
+    def __init__(self, name):
+        self.name = name
+
+    def _url(self, path):
+        base = os.environ.get(_link_env_name(self.name))
+        if not base:
+            raise RuntimeError(
+                f'drift: not linked to slice "{self.name}" — run `drift slice link add {self.name}`'
+            )
+        return base.rstrip("/") + "/" + str(path).lstrip("/")
+
+    def request(self, method, path, headers=None, body=None):
+        h = {"X-Drift-Slice": os.environ.get("DRIFT_SLICE", "")}
+        if headers:
+            h.update(headers)
+        return http_request(method, self._url(path), headers=h, body=body)
+
+    def get(self, path):
+        return self.request("GET", path)
+
+    def post(self, path, body=None):
+        return self.request(
+            "POST", path,
+            headers={"Content-Type": "application/json"},
+            body=json.dumps(body) if body is not None else None,
+        )
+
+
+def slice(name):
+    """A client for another slice you've LINKED to (`drift slice link`). The
+    call travels in-cluster and carries this slice's identity (X-Drift-Slice)."""
+    return _SliceClient(name)
+
+
+def caller_slice(req):
+    """The linked slice that called this request, or "" if not via a link."""
+    headers = (req or {}).get("headers") or {}
+    for k, v in headers.items():
+        if k.lower() == "x-drift-slice":
+            return v
+    return ""
+
+
+def env(key):
+    """An environment variable value ("" if unset)."""
+    return os.environ.get(key, "")
+
+
+# The sacred triad is the SOLE entrypoint for state primitives — remove the
+# top-level names so everything stateful goes through drift.backbone.
+del secret, cache, nosql, blob, lock, jwt, queue, sql, SQL

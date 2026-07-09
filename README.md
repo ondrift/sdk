@@ -22,9 +22,13 @@ The SDK is what user-written code imports to talk to [Drift](https://ondrift.eu)
 No version is pinned anywhere — reference the SDK unversioned and every build tracks the latest tag.
 
 ```bash
-# Go — name the ROOT module (NOT …/sdk/go: the repo's early history had a
+# Go — name the ROOT module (NOT …/sdk/v2/go: the repo's early history had a
 # nested …/sdk/go module whose stale pseudo-versions still resolve first).
-go get github.com/ondrift/sdk@latest      # then: import drift "github.com/ondrift/sdk/go"
+# The /v2 segment is Go's own semantic-import-versioning rule for a v2+
+# module — a plain `github.com/ondrift/sdk@latest` (no /v2) stays on the v1
+# line forever, by design: existing v1 consumers never see a breaking change
+# land under their feet.
+go get github.com/ondrift/sdk/v2@latest      # then: import drift "github.com/ondrift/sdk/v2/go"
 ```
 ```text
 # Python (requirements.txt)
@@ -61,18 +65,18 @@ A Drift Atomic function is a **named handler with an `@atomic` annotation**. The
 - **Request** — read path params from `req.params`, query from `req.query`, headers from `req.headers`, raw body from `req.body`.
 - **Streaming** — annotate `stream=sse` or `stream=ws`; the handler receives an extra `emit` (SSE) or `conn` (WebSocket) argument.
 
-Backbone also exposes a relational `sql(name)` primitive (`query` / `execute` / `begin`) alongside the key/value, document, queue, blob, lock, and JWT primitives shown below.
+Everything stateful lives under the **Backbone** namespace — the *B* of the sacred A·B·C triad and the **sole entrypoint** for state. Nothing stateful sits at the top level. Backbone groups secrets, key/value cache, NoSQL documents, queues, blobs, locks, JWT, relational `sql(name)`, realtime channels, passwordless **KeyAuth** (Ed25519 device-key auth), and the zero-knowledge **Vault** (recovery store) — all shown per-language below. Cross-slice calling (`slice(name)` / `callerSlice(req)`) stays at the top level on purpose: it's inter-slice networking, the seed of a future *D* pillar — not Backbone.
 
 ---
 
 ## API Reference
 
-The seven Backbone primitives are identical across languages; each section shows that language's idiomatic form.
+The Backbone primitives are identical across languages; each section shows that language's idiomatic form. Reach state through the triad namespace — `drift.Backbone` (Go), `drift.backbone` (Python/Node), `Drift::Backbone` (Ruby), `\Drift\Backbone\…` (PHP), `drift_sdk::backbone` (Rust) — never the top level.
 
 ### Go
 
 ```go
-import drift "github.com/ondrift/sdk/go"
+import drift "github.com/ondrift/sdk/v2/go"
 ```
 
 ```go
@@ -87,17 +91,24 @@ func PostReviewerDecisionId(body RequestBody, req drift.Request) (int, string, a
 // GET handlers take just (req drift.Request).
 ```
 
-**Backbone**
+**Backbone** — the sole entrypoint for state (`drift.Backbone.*`)
 ```go
-drift.Secret.Get("API_KEY")                                    // .Set(k, v), .Delete(k)
-c := drift.NoSQL.Collection("orders")
+drift.Backbone.Secret.Get("API_KEY")                           // .Set(k, v), .Delete(k)
+c := drift.Backbone.NoSQL.Collection("orders")
 c.Insert(doc); c.Get(id); c.Read(key); c.List(filter); c.Delete(key); c.Drop()
-drift.Cache.Set("k", v, 60); drift.Cache.Get("k")             // ttl seconds
-drift.Queue("q").Push(m); drift.Queue("q").Pop()
-drift.Blob.Put("k", data, "image/png"); drift.Blob.Get("k")
-drift.Lock.Acquire("r", 30); drift.Lock.Release("r", token)
-drift.JWT.Issue(drift.JWTClaims{Sub: "alice"}); drift.JWT.Verify(tok, drift.JWTVerifyOptions{})
-drift.Log("msg"); drift.HTTPRequest("GET", url, nil, nil)     // HTTPRequestWithTimeout to override 30s
+drift.Backbone.Cache.Set("k", v, 60); drift.Backbone.Cache.Get("k")        // ttl seconds
+drift.Backbone.Queue("q").Push(m); drift.Backbone.Queue("q").Pop()
+drift.Backbone.Blob.Put("k", data, "image/png"); drift.Backbone.Blob.Get("k")
+drift.Backbone.Lock.Acquire("r", 30); drift.Backbone.Lock.Release("r", token)
+drift.Backbone.SQL("clinic").Query("SELECT …", args)           // .Execute(…), .Begin() (transactions)
+drift.Backbone.JWT.Issue(drift.JWTClaims{Sub: "alice"}); drift.Backbone.JWT.Verify(tok, drift.JWTVerifyOptions{})
+drift.Backbone.Realtime.Channel("events").Publish(msg)         // fan-out → WS subscribers at /realtime/events; .Presence()
+drift.Backbone.KeyAuth.Challenge(pubkey); drift.Backbone.KeyAuth.Verify(pubkey, sig, "my-app")  // passwordless Ed25519 → this slice's JWT
+drift.Backbone.Vault.Put(uid, blob); drift.Backbone.Vault.Get(uid)         // zero-knowledge recovery store (keyvault collection)
+// Top-level (NOT Backbone) — cross-slice networking + utilities:
+drift.Slice("c12").Post("/api/events", body); drift.Slice("c12").Get("/x")  // call a LINKED slice (`drift slice link add c12`); carries X-Drift-Slice
+drift.CallerSlice(req)                                          // name of the linked slice that called you ("" if not via a link)
+drift.Log("msg"); drift.HTTPRequest("GET", url, nil, nil)      // HTTPRequestWithTimeout to override 30s
 ```
 
 ### Python
@@ -115,16 +126,23 @@ def post_submit(body, req):
 # GET handlers take just (req).
 ```
 
-**Backbone**
+**Backbone** — the sole entrypoint for state (`drift.backbone.*`)
 ```python
-drift.secret.get("API_KEY")                                   # .set(k, v), .delete(k)
-c = drift.nosql.collection("orders")
+drift.backbone.secret.get("API_KEY")                          # .set(k, v), .delete(k)
+c = drift.backbone.nosql.collection("orders")
 c.insert(doc); c.get(id); c.read(key); c.list(filter); c.delete(key); c.drop()
-drift.cache.set("k", v, 60); drift.cache.get("k"); drift.cache.delete("k")
-drift.queue("q").push(m); drift.queue("q").pop()
-drift.blob.put("k", data); drift.blob.get("k")
-drift.lock.acquire("r", ttl=30); drift.lock.release("r", token)
-drift.jwt.issue({"sub": "alice"}); drift.jwt.verify(tok)      # raises drift.JWTError
+drift.backbone.cache.set("k", v, 60); drift.backbone.cache.get("k"); drift.backbone.cache.delete("k")
+drift.backbone.queue("q").push(m); drift.backbone.queue("q").pop()
+drift.backbone.blob.put("k", data); drift.backbone.blob.get("k")
+drift.backbone.lock.acquire("r", ttl=30); drift.backbone.lock.release("r", token)
+db = drift.backbone.sql("clinic"); db.query("SELECT …", args)  # .execute(…), .begin()
+drift.backbone.jwt.issue({"sub": "alice"}); drift.backbone.jwt.verify(tok)      # raises drift.JWTError
+drift.backbone.realtime.channel("events").publish(msg)        # fan-out → WS subscribers at /realtime/events; .presence()
+drift.backbone.keyauth.challenge(pubkey); drift.backbone.keyauth.verify(pubkey, sig, "my-app")
+drift.backbone.vault.put(uid, blob); drift.backbone.vault.get(uid)
+# Top-level (NOT Backbone) — cross-slice networking + utilities:
+drift.slice("c12").post("/api/events", body); drift.slice("c12").get("/x")
+drift.caller_slice(req)
 drift.log("msg"); drift.http_request("GET", url, timeout=30)
 ```
 
@@ -144,16 +162,23 @@ async function getStatusToken(req) {
 module.exports = { getStatusToken };   // export the handler for the CLI wrapper
 ```
 
-**Backbone** (Backbone calls are `async` — `await` them)
+**Backbone** — the sole entrypoint for state (`drift.backbone.*`; calls are `async` — `await` them)
 ```js
-await drift.secret.get("API_KEY");                            // .set(k, v), .delete(k)
-const c = drift.nosql.collection("orders");
+await drift.backbone.secret.get("API_KEY");                   // .set(k, v), .delete(k)
+const c = drift.backbone.nosql.collection("orders");
 await c.insert(doc); await c.get(id); await c.read(key); await c.list(filter); await c.delete(key); await c.drop();
-await drift.cache.set("k", v, 60); await drift.cache.get("k"); await drift.cache.delete("k");
-await drift.queue("q").push(m); await drift.queue("q").pop();
-await drift.blob.put("k", data); await drift.blob.get("k");
-await drift.lock.acquire("r", 30); await drift.lock.release("r", token);
-await drift.jwt.issue({ sub: "alice" }); await drift.jwt.verify(tok);   // throws drift.JWTError
+await drift.backbone.cache.set("k", v, 60); await drift.backbone.cache.get("k"); await drift.backbone.cache.delete("k");
+await drift.backbone.queue("q").push(m); await drift.backbone.queue("q").pop();
+await drift.backbone.blob.put("k", data); await drift.backbone.blob.get("k");
+await drift.backbone.lock.acquire("r", 30); await drift.backbone.lock.release("r", token);
+const db = drift.backbone.sql("clinic"); await db.query("SELECT …", args);   // .execute(…), .begin()
+await drift.backbone.jwt.issue({ sub: "alice" }); await drift.backbone.jwt.verify(tok);   // throws drift.JWTError
+await drift.backbone.realtime.channel("events").publish(msg); // fan-out → WS subscribers at /realtime/events; .presence()
+await drift.backbone.keyauth.challenge(pubkey); await drift.backbone.keyauth.verify(pubkey, sig, "my-app");
+await drift.backbone.vault.put(uid, blob); await drift.backbone.vault.get(uid);
+// Top-level (NOT Backbone) — cross-slice networking + utilities:
+await drift.slice("c12").post("/api/events", body); await drift.slice("c12").get("/x");
+drift.callerSlice(req);
 drift.log("msg"); await drift.httpRequest("GET", url);                  // { timeoutMs } 5th arg
 ```
 
@@ -166,23 +191,30 @@ require "drift"   # requires Ruby 3.0+
 ```ruby
 # @atomic http=get:reviewer/queue auth=none
 def get_reviewer_queue(req)
-  rows = Drift::Nosql.collection("submissions").list
+  rows = Drift::Backbone::Nosql.collection("submissions").list
   { "status" => 200, "message" => "OK", "payload" => { "count" => rows.length } }
 end
 
 Drift.run(method(:get_reviewer_queue))   # Ruby: end the file with this
 ```
 
-**Backbone**
+**Backbone** — the sole entrypoint for state (`Drift::Backbone::*`)
 ```ruby
-Drift::Secret.get("API_KEY")                                  # .set(k, v)
-c = Drift::Nosql.collection("orders")
+Drift::Backbone::Secret.get("API_KEY")                        # .set(k, v), .delete(k)
+c = Drift::Backbone::Nosql.collection("orders")
 c.insert(doc); c.get(id); c.list(filter)
-Drift::Cache.get("k"); Drift::Cache.set("k", v, ttl: 60)
-Drift.queue("q").push(m); Drift.queue("q").pop
-Drift::Blob.put("k", data, content_type: "image/png"); Drift::Blob.get("k")
-Drift::Lock.acquire("r", ttl: 30); Drift::Lock.release("r", token)
-Drift::JWT.issue(sub: "alice", exp: Time.now.to_i + 3600); Drift::JWT.verify(tok)   # raises Drift::JWTError
+Drift::Backbone::Cache.get("k"); Drift::Backbone::Cache.set("k", v, ttl: 60)
+Drift::Backbone.queue("q").push(m); Drift::Backbone.queue("q").pop
+Drift::Backbone::Blob.put("k", data, content_type: "image/png"); Drift::Backbone::Blob.get("k")
+Drift::Backbone::Lock.acquire("r", ttl: 30); Drift::Backbone::Lock.release("r", token)
+db = Drift::Backbone.sql("clinic"); db.query("SELECT …", args)   # .execute(…), .transaction { |tx| … }
+Drift::Backbone::JWT.issue(sub: "alice", exp: Time.now.to_i + 3600); Drift::Backbone::JWT.verify(tok)   # raises Drift::JWTError
+Drift::Backbone::Realtime.channel("events").publish(msg)      # fan-out → WS subscribers at /realtime/events; .presence
+Drift::Backbone::KeyAuth.challenge(pubkey); Drift::Backbone::KeyAuth.verify(pubkey, sig, "my-app")
+Drift::Backbone::Vault.put(uid, blob); Drift::Backbone::Vault.get(uid)
+# Top-level (NOT Backbone) — cross-slice networking + utilities:
+Drift.slice("c12").post("/api/events", body); Drift.slice("c12").get("/x")
+Drift.caller_slice(req)
 Drift.log("msg"); Drift.http_request("GET", url, timeout: 30)
 ```
 
@@ -205,16 +237,23 @@ function queue_notifier($body, $req = null) {
 // HTTP handlers take ($req) for GET, ($body, $req) when there's a body.
 ```
 
-**Backbone**
+**Backbone** — the sole entrypoint for state (`\Drift\Backbone\…`)
 ```php
-\Drift\Secret::get('API_KEY');                                // ::set($k, $v), ::delete($k)
-$c = \Drift\Nosql::collection('orders');
+\Drift\Backbone\Secret::get('API_KEY');                       // ::set($k, $v), ::delete($k)
+$c = \Drift\Backbone\Nosql::collection('orders');
 $c->insert($doc); $c->get($id); $c->read($key); $c->list($filter); $c->delete($key); $c->drop();
-\Drift\Cache::set('k', $v, 60); \Drift\Cache::get('k'); \Drift\Cache::delete('k');
-\Drift\queue('q')->push($m); \Drift\queue('q')->pop();
-\Drift\Blob::put('k', $data); \Drift\Blob::get('k');
-\Drift\Lock::acquire('r', 30); \Drift\Lock::release('r', $token);
-\Drift\JWT::issue(['sub' => 'alice']); \Drift\JWT::verify($tok);   // throws \Drift\JWTError
+\Drift\Backbone\Cache::set('k', $v, 60); \Drift\Backbone\Cache::get('k'); \Drift\Backbone\Cache::delete('k');
+\Drift\Backbone\queue('q')->push($m); \Drift\Backbone\queue('q')->pop();
+\Drift\Backbone\Blob::put('k', $data); \Drift\Backbone\Blob::get('k');
+\Drift\Backbone\Lock::acquire('r', 30); \Drift\Backbone\Lock::release('r', $token);
+$db = \Drift\Backbone\sql('clinic'); $db->query('SELECT …', $args);   // ->execute(…), ->transaction(fn($tx)=>…)
+\Drift\Backbone\JWT::issue(['sub' => 'alice']); \Drift\Backbone\JWT::verify($tok);   // throws \Drift\JWTError
+\Drift\Backbone\Realtime::channel('events')->publish($msg);   // fan-out → WS subscribers at /realtime/events; ->presence()
+\Drift\Backbone\KeyAuth::challenge($pubkey); \Drift\Backbone\KeyAuth::verify($pubkey, $sig, 'my-app');
+\Drift\Backbone\Vault::put($uid, $blob); \Drift\Backbone\Vault::get($uid);
+// Top-level (NOT Backbone) — cross-slice networking + utilities:
+\Drift\slice('c12')->post('/api/events', $body); \Drift\slice('c12')->get('/x');
+\Drift\caller_slice($req);
 \Drift\log('msg'); \Drift\http_request('GET', $url);
 ```
 
@@ -240,9 +279,9 @@ pub fn queue_validator(body: Value, _req: Value) -> (i64, &'static str, Value) {
 }
 ```
 
-**Backbone**
+**Backbone** — the sole entrypoint for state (`drift_sdk::backbone::*`)
 ```rust
-use drift_sdk::{secret, cache, nosql, queue, blob, lock, jwt};
+use drift_sdk::backbone::{secret, cache, nosql, queue, blob, lock, jwt, sql, realtime, keyauth, vault};
 secret::get("API_KEY");                                       // set(k, v), delete(k)
 let c = nosql::collection("orders");
 c.insert(doc); c.get(id); c.read(key); c.list(Some(filter)); c.delete(key); c.drop();
@@ -250,7 +289,14 @@ cache::set("k", v, 60); cache::get("k"); cache::delete("k");
 queue("q").push(m); queue("q").pop();
 blob::put("k", &data, Some("image/png")); blob::get("k");
 lock::acquire("r", 30); lock::release("r", &token);
-jwt::issue(claims); jwt::verify(&tok, None, None);           // -> Result<Value, JWTError>
+let db = sql("clinic"); db.query("SELECT …", &args);         // .execute(…), .begin()
+jwt::issue(claims); jwt::verify(&tok, None, None);           // -> Result<Value, jwt::JWTError>
+realtime::channel("events").publish(msg);                    // fan-out → WS subscribers at /realtime/events; .presence()
+keyauth::challenge(&pubkey); keyauth::verify(&pubkey, &sig, "my-app");
+vault::put(uid, blob); vault::get(uid);
+// Top-level (NOT Backbone) — cross-slice networking + utilities:
+drift_sdk::slice("c12").post("/api/events", Some(body)); drift_sdk::slice("c12").get("/x");
+drift_sdk::caller_slice(&req);
 drift_sdk::log("msg"); drift_sdk::http_request("GET", url, None, None);
 ```
 
@@ -270,4 +316,4 @@ MIT — see [`LICENSE`](LICENSE).
 
 ---
 
-*This is the single source of truth for all six SDKs. Any change to the public API surface of any language MUST update the matching section above in the same change. Last verified 2026-06-08.*
+*This is the single source of truth for all six SDKs. Any change to the public API surface of any language MUST update the matching section above in the same change. Last verified 2026-06-27 — all six languages namespaced under `Backbone` (sole entrypoint for state) with Realtime + KeyAuth + Vault, plus top-level slice-link.*
