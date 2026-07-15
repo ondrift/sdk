@@ -126,12 +126,15 @@ function _initBackboneTransport(rawUrl) {
   };
 }
 
-function _backboneRequest(method, path, body, contentType) {
+// extraHeaders is an optional plain object merged in ahead of Content-Type —
+// today its one caller is Deed.Pocket, whose routes are JWT-gated and need
+// an Authorization: Bearer header (see _callAuth below).
+function _backboneRequest(method, path, body, contentType, extraHeaders) {
   const http = require("http");
   if (_backboneRequestOpts === null) _initBackboneTransport(_getBackboneUrl());
 
   return new Promise((resolve, reject) => {
-    const headers = {};
+    const headers = Object.assign({}, extraHeaders);
     if (body) headers["Content-Type"] = contentType || "application/json";
     const opts = Object.assign({}, _backboneRequestOpts, {
       method,
@@ -157,6 +160,14 @@ async function _call(method, path, body) {
 
   const payload = body !== undefined && body !== null ? JSON.stringify(body) : null;
   const { status, body: respBody } = await _backboneRequest(method, path, payload);
+  // A non-2xx response body is an ERROR, not data — matches Go's
+  // callBackboneHTTP and Deed's _callChecked below. Without this, a
+  // 404/409/etc body (e.g. Secret.get on an undeclared name, a lock
+  // conflict) was returned to the caller as if it were the value.
+  if (status >= 400) {
+    const text = respBody.toString("utf8").trim();
+    throw new Error(`drift: backbone ${method} ${path}: HTTP ${status}${text ? `: ${text}` : ""}`);
+  }
   if (status === 204 || respBody.length === 0) return null;
   const text = respBody.toString("utf8");
   try {
@@ -183,6 +194,112 @@ async function _callRaw(method, path, dataBytes, contentType) {
   }
   // Preserve the previous fetch-based ArrayBuffer return shape.
   return respBody.buffer.slice(respBody.byteOffset, respBody.byteOffset + respBody.byteLength);
+}
+
+// ---------------------------------------------------------------------------
+// Deed transport
+// ---------------------------------------------------------------------------
+//
+// Deed has its own listener/port now (DEED_URL) — a separate connection
+// pool from Backbone's, mirroring _backboneUrl/_backboneAgent/
+// _backboneRequest exactly (sharing one Agent between the two would pool
+// sockets to the wrong port on every call that alternates between Backbone
+// and Deed). Like the generic `_call` above (which now applies the same
+// status >= 400 check), these treat a non-2xx response as an error rather
+// than handing the caller whatever body came back — the "a get on a
+// missing item is an error, not a silent null" convention every Backbone/
+// Deed primitive shares (mirrors Go's callBackboneHTTP, applied uniformly).
+
+let _deedUrl = null;
+let _deedAgent = null;
+let _deedRequestOpts = null;
+
+function _getDeedUrl() {
+  if (_deedUrl === null) {
+    _deedUrl = process.env.DEED_URL || "";
+  }
+  return _deedUrl;
+}
+
+function _initDeedTransport(rawUrl) {
+  const http = require("http");
+  const u = new URL(rawUrl);
+  _deedAgent = new http.Agent({ keepAlive: true, maxSockets: 10 });
+  _deedRequestOpts = {
+    host: u.hostname,
+    port: u.port || 80,
+    agent: _deedAgent,
+  };
+}
+
+function _deedRequest(method, path, body, contentType, extraHeaders) {
+  const http = require("http");
+  if (_deedRequestOpts === null) _initDeedTransport(_getDeedUrl());
+
+  return new Promise((resolve, reject) => {
+    const headers = Object.assign({}, extraHeaders);
+    if (body) headers["Content-Type"] = contentType || "application/json";
+    const opts = Object.assign({}, _deedRequestOpts, {
+      method,
+      path: "/" + path,
+      headers,
+    });
+    const req = http.request(opts, (resp) => {
+      const chunks = [];
+      resp.on("data", (c) => chunks.push(c));
+      resp.on("end", () => {
+        resolve({ status: resp.statusCode, body: Buffer.concat(chunks) });
+      });
+    });
+    req.on("error", reject);
+    if (body) req.write(body);
+    req.end();
+  });
+}
+
+async function _callChecked(method, path, body) {
+  const base = _getDeedUrl();
+  if (!base) {
+    throw new Error("drift: deed requires a running slice (DEED_URL) — not available in local dev");
+  }
+  const payload = body !== undefined && body !== null ? JSON.stringify(body) : null;
+  const { status, body: respBody } = await _deedRequest(method, path, payload);
+  if (status >= 400) {
+    throw new Error(`deed ${method} ${path}: HTTP ${status} ${respBody.toString("utf8")}`);
+  }
+  if (status === 204 || respBody.length === 0) return null;
+  const text = respBody.toString("utf8");
+  try {
+    return JSON.parse(text);
+  } catch {
+    return text;
+  }
+}
+
+// _callAuth is _callChecked with a bearer token attached — used only by
+// Deed.Pocket, whose routes are JWT-gated (unlike every other loopback-open
+// Backbone/Deed primitive). Local dev (no DEED_URL) has no JWT
+// verification to check a token against, so — same as KeyAuth/JWT already
+// — this call isn't available without a running slice.
+async function _callAuth(method, path, token, body) {
+  const base = _getDeedUrl();
+  if (!base) {
+    throw new Error("drift: deed pocket requires a running slice (DEED_URL) — not available in local dev");
+  }
+  const payload = body !== undefined && body !== null ? JSON.stringify(body) : null;
+  const { status, body: respBody } = await _deedRequest(
+    method, path, payload, "application/json", { Authorization: `Bearer ${token}` },
+  );
+  if (status >= 400) {
+    throw new Error(`deed ${method} ${path}: HTTP ${status} ${respBody.toString("utf8")}`);
+  }
+  if (status === 204 || respBody.length === 0) return null;
+  const text = respBody.toString("utf8");
+  try {
+    return JSON.parse(text);
+  } catch {
+    return text;
+  }
 }
 
 // In-memory backbone for local dev.
@@ -400,7 +517,10 @@ const blob = {
     const base = _getBackboneUrl();
     if (!base) return _store.blobs[path] || null;
     const resp = await fetch(`${base}/${path}`);
-    if (!resp.ok) return null;
+    if (!resp.ok) {
+      const text = (await resp.text()).trim();
+      throw new Error(`drift: backbone GET ${path}: HTTP ${resp.status}${text ? `: ${text}` : ""}`);
+    }
     return Buffer.from(await resp.arrayBuffer());
   },
 };
@@ -453,63 +573,6 @@ async function httpRequest(method, url, headers, body, opts) {
 
 // Exports collected at the bottom of the file (single canonical
 // `module.exports = {...}` block) once every symbol is declared.
-
-// ─── JWT primitive ───────────────────────────────────────────────────────────
-//
-// HS256 minting + verification, signed with the slice's per-slice JKey. The
-// signing key never leaves the slice's backbone process; all operations flow
-// through loopback HTTP to backbone /jwt/{sign,verify,slice-id}.
-//
-// Design: internal/todo/slice-jwt-primitive.md.
-
-class JWTError extends Error {
-  constructor(reason) {
-    super(`jwt verify: ${reason}`);
-    this.name = "JWTError";
-    this.reason = reason;
-  }
-}
-
-const jwt = {
-  /**
-   * Sign a JWT with the slice's HS256 JKey.
-   *
-   * `claims.exp` is required. `iat`, `iss`, and `jti` are auto-set when
-   * unset. `claims.custom` is a plain object of app-specific claims that
-   * the platform never inspects.
-   */
-  async issue(claims = {}) {
-    const body = {};
-    for (const k of ["sub", "iat", "exp", "nbf", "iss", "aud", "jti", "custom"]) {
-      if (claims[k] !== undefined && claims[k] !== null) body[k] = claims[k];
-    }
-    const resp = await _call("POST", "jwt/sign", body);
-    return resp && resp.token ? resp.token : null;
-  },
-
-  /**
-   * Validate a token. Resolves with the parsed claims object on success;
-   * throws JWTError on validation failure with a stable wire `reason`.
-   */
-  async verify(token, opts = {}) {
-    const body = { token };
-    if (opts.audience) body.audience = opts.audience;
-    if (opts.allowedIssuer) body.allowed_issuer = opts.allowedIssuer;
-    const resp = await _call("POST", "jwt/verify", body);
-    if (!resp || typeof resp !== "object") throw new JWTError("internal_error");
-    if (!resp.valid) throw new JWTError(resp.reason || "internal_error");
-    return resp.claims || {};
-  },
-
-  /** The slice's auto-set issuer string ("drift-slice-<user>-<slice>"). */
-  async sliceId() {
-    const resp = await _call("GET", "jwt/slice-id");
-    return resp && resp.slice_id ? resp.slice_id : "";
-  },
-};
-
-// (jwt + JWTError exported in the canonical module.exports block at the
-// bottom of the file.)
 
 // ─── SSE (Server-Sent Events) ────────────────────────────────────────────────
 
@@ -778,7 +841,26 @@ const realtime = {
   }),
 };
 
-// ─── KeyAuth (backbone.keyauth) ───────────────────────────────────────────────
+// ================================================================
+// Deed — identity, verified. The fourth pillar alongside Atomic /
+// Backbone / Canvas — a peer subsystem, not a Backbone primitive, with its
+// own loopback listener (DEED_URL) separate from Backbone's
+// (BACKBONE_URL).
+//
+//   deed.keyauth / jwt / vault / link / pocket
+//
+// KeyAuth: passwordless Ed25519 device-key auth. JWT: general-purpose
+// HS256 sign/verify (KeyAuth mints its own tokens through it). Vault: an
+// account-key-wrapped keyring. Link: multi-device attestation /
+// enrollment / revocation. Pocket: E2EE per-identity app data, JWT-gated.
+//
+// Not to be confused with cross-slice calling (slice(name) / callerSlice,
+// further below) — that's inter-slice networking, a different, still-
+// hypothetical future pillar. deed.link enrolls another DEVICE for the
+// same identity; it has nothing to do with calling another SLICE.
+// ================================================================
+
+// ─── KeyAuth (Deed.keyauth) ────────────────────────────────────────────────────
 //
 // Passwordless Ed25519 device-key auth. uid = the public key. challenge mints a
 // one-time nonce; the client signs the canonical {domain,nonce,pubkey}; verify
@@ -786,48 +868,199 @@ const realtime = {
 // client half (keygen + recovery phrase) is the @ondrift/keyauth library.
 const keyauth = {
   challenge: async (pubkey) => {
-    const resp = await _call("POST", "keyauth/challenge", { pubkey });
+    const resp = await _callChecked("POST", "keyauth/challenge", { pubkey });
     return (resp && resp.nonce) || "";
   },
   verify: async (pubkey, sig, domain) => {
-    const resp = await _call("POST", "keyauth/verify", { pubkey, sig, domain });
+    const resp = await _callChecked("POST", "keyauth/verify", { pubkey, sig, domain });
     return (resp && resp.token) || "";
   },
 };
 
-// ─── Vault (backbone.vault) ───────────────────────────────────────────────────
+// ─── JWT (Deed.jwt) ─────────────────────────────────────────────────────────────
 //
-// Zero-knowledge recovery store: user-scoped, append-only, opaque. The client
-// encrypts the blob under a key the slice never sees, so Drift stores it but
-// can't read it. Backed by the `keyvault` NoSQL collection (declare it).
-const vault = {
-  put: async (uid, blob) => {
-    await nosql.collection("keyvault").insert({
-      _id: `${uid}:${process.hrtime.bigint()}`,
-      user_id: uid,
-      blob,
-      updated_at: Math.floor(Date.now() / 1000),
-    });
-  },
-  get: async (uid) => {
-    const rows = await nosql.collection("keyvault").list({ user_id: uid });
-    let bestAt = -1;
-    let best = null;
-    for (const r of rows) {
-      const at = (r && r.updated_at) || 0;
-      if (at >= bestAt) { bestAt = at; best = r.blob; }
+// HS256 minting + verification, signed with the slice's per-slice JKey. The
+// signing key never leaves the slice's backbone process; all operations flow
+// through loopback HTTP to backbone /jwt/{sign,verify,slice-id}.
+//
+// Design: internal/todo/slice-jwt-primitive.md.
+
+class JWTError extends Error {
+  constructor(reason) {
+    super(`jwt verify: ${reason}`);
+    this.name = "JWTError";
+    this.reason = reason;
+  }
+}
+
+const jwt = {
+  /**
+   * Sign a JWT with the slice's HS256 JKey.
+   *
+   * `claims.exp` is required. `iat`, `iss`, and `jti` are auto-set when
+   * unset. `claims.custom` is a plain object of app-specific claims that
+   * the platform never inspects.
+   */
+  async issue(claims = {}) {
+    const body = {};
+    for (const k of ["sub", "iat", "exp", "nbf", "iss", "aud", "jti", "custom"]) {
+      if (claims[k] !== undefined && claims[k] !== null) body[k] = claims[k];
     }
-    return best === undefined ? null : best;
+    const resp = await _callChecked("POST", "jwt/sign", body);
+    return resp && resp.token ? resp.token : null;
+  },
+
+  /**
+   * Validate a token. Resolves with the parsed claims object on success;
+   * throws JWTError on validation failure with a stable wire `reason`.
+   */
+  async verify(token, opts = {}) {
+    const body = { token };
+    if (opts.audience) body.audience = opts.audience;
+    if (opts.allowedIssuer) body.allowed_issuer = opts.allowedIssuer;
+    const resp = await _callChecked("POST", "jwt/verify", body);
+    if (!resp || typeof resp !== "object") throw new JWTError("internal_error");
+    if (!resp.valid) throw new JWTError(resp.reason || "internal_error");
+    return resp.claims || {};
+  },
+
+  /** The slice's auto-set issuer string ("drift-slice-<user>-<slice>"). */
+  async sliceId() {
+    const resp = await _callChecked("GET", "jwt/slice-id");
+    return resp && resp.slice_id ? resp.slice_id : "";
   },
 };
+
+// ─── Vault (Deed.vault) ─────────────────────────────────────────────────────────
+//
+// Zero-knowledge recovery store: opaque, user-scoped, append-only. The client
+// encrypts the blob under a key derived from its recovery phrase (which the
+// slice NEVER sees), so Drift stores the backup but cannot read it. Backed by
+// Deed's own dedicated routes (deed/vault/*) — replaces the old generic-NoSQL-
+// collection implementation entirely; no Driftfile declaration needed.
+const vault = {
+  /** Appends an opaque encrypted backup blob for uid (append-only — a new version each call). */
+  put: (uid, blob) => _callChecked("POST", "deed/vault/put", { uid, blob }),
+
+  /**
+   * Returns the most recent backup blob for uid. Throws if uid has never
+   * written one — same "missing is an error, not a silent null" convention
+   * as Pocket.get.
+   */
+  get: async (uid) => {
+    const resp = await _callChecked("GET", `deed/vault/get?uid=${encodeURIComponent(uid)}`);
+    if (!resp || typeof resp.blob === "undefined") {
+      throw new Error("drift: vault.get: no vault entry for uid");
+    }
+    return resp.blob;
+  },
+};
+
+// ─── Link (Deed.link) ───────────────────────────────────────────────────────────
+//
+// Multi-device continuity: generalizes the enroll/attest/revoke pattern so an
+// identity's KeyAuth session can move to a second, third, ... device. The
+// signature parameters below (sig, attestingPubkey, ...) are produced entirely
+// client-side — this SDK only forwards them, the same way keyauth.verify
+// forwards a signature it never computes itself. The one rule the whole design
+// rests on: Deed verifies, it never decides — a device is only ever added on
+// the strength of a signature from a device already active in the identity's
+// registry.
+//
+// Not to be confused with cross-slice calling (slice(name)/callerSlice, further
+// below) — this Link enrolls a DEVICE for one identity, it does not call
+// another slice.
+const link = {
+  /**
+   * Starts a device-linking session for a not-yet-enrolled device's pubkey
+   * (usually carried in a QR code alongside the pubkey). Returns a session ID
+   * for an already-active device to present to attest.
+   */
+  begin: async (pubkey) => {
+    const resp = await _callChecked("POST", "deed/link/begin", { pubkey });
+    return (resp && resp.session_id) || "";
+  },
+
+  /**
+   * Has an already-active device vouch for the session's pending device. sig
+   * is the client's signature over the canonical {domain,identity,new_pubkey}
+   * message — computed client-side, never by this SDK.
+   */
+  attest: (identity, sessionId, attestingPubkey, sig) =>
+    _callChecked("POST", "deed/link/attest", {
+      identity, session_id: sessionId, attesting_pubkey: attestingPubkey, sig,
+    }),
+
+  /**
+   * Polls a session the new device started with begin, returning whether an
+   * active device has attested it yet: `{status, identity?}` — identity is
+   * only set once status === "attested".
+   */
+  complete: async (sessionId) =>
+    (await _callChecked("POST", "deed/link/complete", { session_id: sessionId })) || {},
+
+  /**
+   * Deactivates targetPubkey in identity's device registry. Any currently-
+   * active device may revoke another (or itself); revokingPubkey is the
+   * device doing the revoking, sig its signature over the canonical
+   * {domain,identity,target_pubkey} message.
+   */
+  revoke: (identity, targetPubkey, revokingPubkey, sig) =>
+    _callChecked("POST", "deed/link/revoke", {
+      identity, target_pubkey: targetPubkey, revoking_pubkey: revokingPubkey, sig,
+    }),
+};
+
+// ─── Pocket (Deed.pocket) ────────────────────────────────────────────────────────
+//
+// An app's actual data — E2EE, content-keyed, following an identity across
+// every device Link has enrolled. The crypto work happens entirely
+// client-side before anything reaches this primitive; Pocket never encrypts or
+// decrypts the payload itself. Every call takes `token` explicitly (the JWT
+// keyauth.verify returned) rather than holding hidden session state —
+// matching the rest of this SDK's stateless posture inside an Atomic function
+// invocation. The token's sub is the only identity a call can read or write
+// under; there is no way to name a different one.
+const pocket = {
+  /** Stores blob under key for whichever identity token resolves to. */
+  set: (token, key, blob) => _callAuth("POST", "deed/pocket/set", token, { key, blob }),
+
+  /** Returns the blob stored under key for token's identity. Throws if no such key exists. */
+  get: async (token, key) => {
+    const resp = await _callAuth("GET", `deed/pocket/get?key=${encodeURIComponent(key)}`, token);
+    if (!resp || typeof resp.blob === "undefined") {
+      throw new Error("drift: pocket.get: no such key");
+    }
+    return resp.blob;
+  },
+
+  /** Removes key for token's identity. Throws if no such key exists. */
+  delete: (token, key) => _callAuth("POST", "deed/pocket/delete", token, { key }),
+
+  /** Returns every key stored under token's identity — never another identity's, even by guessing. */
+  list: async (token) => {
+    const resp = await _callAuth("GET", "deed/pocket/list", token);
+    return Array.isArray(resp) ? resp : [];
+  },
+};
+
+// ─── Deed — the fourth pillar, a peer of Backbone ───────────────────────────────
+//
+// The single entrypoint for every identity primitive. See the module header
+// comment above for the full rationale and the slice(name) disambiguation.
+const deed = { keyauth, jwt, vault, link, pocket };
 
 // ─── Backbone — the B of the sacred A·B·C triad ───────────────────────────────
 //
 // The single entrypoint for every stateful primitive. Nothing stateful lives at
-// the top level; the triad is the namespace for everything under it.
-const backbone = { secret, cache, nosql, queue, blob, lock, sql, jwt, realtime, keyauth, vault };
+// the top level; the triad is the namespace for everything under it. (Identity
+// — keyauth/jwt/vault/link/pocket — lives under `deed`, above, a peer of
+// Backbone rather than one of its primitives.)
+const backbone = { secret, cache, nosql, queue, blob, lock, sql, realtime };
 
-// ─── Slice-to-slice linking (top-level; seed of a future "D") ─────────────────
+// ─── Slice-to-slice linking (top-level; inter-slice networking — a different,
+// still-hypothetical future pillar, NOT the same as deed.link device
+// enrollment above) ─────────────────────────────────────────────────────────
 
 function _linkEnvName(name) {
   return "DRIFT_LINK_" + name.toUpperCase().replace(/[^A-Z0-9]/g, "_") + "_URL";
@@ -867,14 +1100,16 @@ function env(key) {
 
 // ---------------------------------------------------------------------------
 // Exports — single canonical assignment. State primitives live under
-// `backbone` (the sacred triad); Atomic entrypoints, utilities, and the
-// proto-"D" slice-link stay top-level.
+// `backbone` (the sacred triad); identity primitives live under `deed` (the
+// fourth pillar); Atomic entrypoints, utilities, and cross-slice linking
+// (a different, still-hypothetical future pillar) stay top-level.
 // ---------------------------------------------------------------------------
 
 module.exports = {
   run, runSSE, runWS,
   log, httpRequest, env,
   backbone,
+  deed,
   slice, callerSlice,
   JWTError,
 };

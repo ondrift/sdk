@@ -22,13 +22,13 @@ The SDK is what user-written code imports to talk to [Drift](https://ondrift.eu)
 No version is pinned anywhere — reference the SDK unversioned and every build tracks the latest tag.
 
 ```bash
-# Go — name the ROOT module (NOT …/sdk/v2/go: the repo's early history had a
+# Go — name the ROOT module (NOT …/sdk/v3/go: the repo's early history had a
 # nested …/sdk/go module whose stale pseudo-versions still resolve first).
-# The /v2 segment is Go's own semantic-import-versioning rule for a v2+
-# module — a plain `github.com/ondrift/sdk@latest` (no /v2) stays on the v1
+# The /v3 segment is Go's own semantic-import-versioning rule for a v2+
+# module — a plain `github.com/ondrift/sdk@latest` (no /v3) stays on the v1
 # line forever, by design: existing v1 consumers never see a breaking change
 # land under their feet.
-go get github.com/ondrift/sdk/v2@latest      # then: import drift "github.com/ondrift/sdk/v2/go"
+go get github.com/ondrift/sdk/v3@latest      # then: import drift "github.com/ondrift/sdk/v3/go"
 ```
 ```text
 # Python (requirements.txt)
@@ -65,18 +65,18 @@ A Drift Atomic function is a **named handler with an `@atomic` annotation**. The
 - **Request** — read path params from `req.params`, query from `req.query`, headers from `req.headers`, raw body from `req.body`.
 - **Streaming** — annotate `stream=sse` or `stream=ws`; the handler receives an extra `emit` (SSE) or `conn` (WebSocket) argument.
 
-Everything stateful lives under the **Backbone** namespace — the *B* of the sacred A·B·C triad and the **sole entrypoint** for state. Nothing stateful sits at the top level. Backbone groups secrets, key/value cache, NoSQL documents, queues, blobs, locks, JWT, relational `sql(name)`, realtime channels, passwordless **KeyAuth** (Ed25519 device-key auth), and the zero-knowledge **Vault** (recovery store) — all shown per-language below. Cross-slice calling (`slice(name)` / `callerSlice(req)`) stays at the top level on purpose: it's inter-slice networking, the seed of a future *D* pillar — not Backbone.
+Everything stateful lives under the **Backbone** namespace — the *B* of the sacred A·B·C triad and the **sole entrypoint** for state. Nothing stateful sits at the top level. Backbone groups secrets, key/value cache, NoSQL documents, queues, blobs, locks, relational `sql(name)`, and realtime channels — all shown per-language below. Identity lives under a separate **Deed** namespace instead — a peer pillar, not a Backbone primitive, with its own listener/port (`DEED_URL`) separate from Backbone's — grouping passwordless **KeyAuth** (Ed25519 device-key auth), general-purpose **JWT** sign/verify, the zero-knowledge **Vault** (recovery store), **Link** (multi-device attestation/enrollment/revocation), and **Pocket** (E2EE per-identity app data). Cross-slice calling (`slice(name)` / `callerSlice(req)`) stays at the top level on purpose: it's inter-slice networking, a different, still-hypothetical future pillar — not Backbone, and not the same thing as Deed's `Link` (which enrolls a device for one identity, not a slice-to-slice call).
 
 ---
 
 ## API Reference
 
-The Backbone primitives are identical across languages; each section shows that language's idiomatic form. Reach state through the triad namespace — `drift.Backbone` (Go), `drift.backbone` (Python/Node), `Drift::Backbone` (Ruby), `\Drift\Backbone\…` (PHP), `drift_sdk::backbone` (Rust) — never the top level.
+The Backbone and Deed primitives are each identical across languages; every section shows that language's idiomatic form. Reach state through `drift.Backbone` (Go), `drift.backbone` (Python/Node), `Drift::Backbone` (Ruby), `\Drift\Backbone\…` (PHP), `drift_sdk::backbone` (Rust); reach identity through the parallel `Deed` / `deed` / `Drift::Deed` / `\Drift\Deed\…` / `drift_sdk::deed` namespace — never the top level.
 
 ### Go
 
 ```go
-import drift "github.com/ondrift/sdk/v2/go"
+import drift "github.com/ondrift/sdk/v3/go"
 ```
 
 ```go
@@ -101,11 +101,18 @@ drift.Backbone.Queue("q").Push(m); drift.Backbone.Queue("q").Pop()
 drift.Backbone.Blob.Put("k", data, "image/png"); drift.Backbone.Blob.Get("k")
 drift.Backbone.Lock.Acquire("r", 30); drift.Backbone.Lock.Release("r", token)
 drift.Backbone.SQL("clinic").Query("SELECT …", args)           // .Execute(…), .Begin() (transactions)
-drift.Backbone.JWT.Issue(drift.JWTClaims{Sub: "alice"}); drift.Backbone.JWT.Verify(tok, drift.JWTVerifyOptions{})
 drift.Backbone.Realtime.Channel("events").Publish(msg)         // fan-out → WS subscribers at /realtime/events; .Presence()
-drift.Backbone.KeyAuth.Challenge(pubkey); drift.Backbone.KeyAuth.Verify(pubkey, sig, "my-app")  // passwordless Ed25519 → this slice's JWT
-drift.Backbone.Vault.Put(uid, blob); drift.Backbone.Vault.Get(uid)         // zero-knowledge recovery store (keyvault collection)
-// Top-level (NOT Backbone) — cross-slice networking + utilities:
+```
+
+**Deed** — identity, a peer pillar, not Backbone (`drift.Deed.*`)
+```go
+drift.Deed.KeyAuth.Challenge(pubkey); drift.Deed.KeyAuth.Verify(pubkey, sig, "my-app")  // passwordless Ed25519 → this slice's JWT
+drift.Deed.JWT.Issue(drift.JWTClaims{Sub: "alice"}); drift.Deed.JWT.Verify(tok, drift.JWTVerifyOptions{})
+drift.Deed.Vault.Put(uid, blob); drift.Deed.Vault.Get(uid)                 // zero-knowledge recovery store, dedicated routes
+drift.Deed.Link.Begin(pubkey); drift.Deed.Link.Attest(identity, sid, attestingPubkey, sig)
+drift.Deed.Link.Complete(sid); drift.Deed.Link.Revoke(identity, targetPubkey, revokingPubkey, sig)
+drift.Deed.Pocket.Set(token, "k", blob); drift.Deed.Pocket.Get(token, "k")  // every call takes the bearer token explicitly
+// Top-level (NOT Backbone, NOT Deed) — cross-slice networking + utilities:
 drift.Slice("c12").Post("/api/events", body); drift.Slice("c12").Get("/x")  // call a LINKED slice (`drift slice link add c12`); carries X-Drift-Slice
 drift.CallerSlice(req)                                          // name of the linked slice that called you ("" if not via a link)
 drift.Log("msg"); drift.HTTPRequest("GET", url, nil, nil)      // HTTPRequestWithTimeout to override 30s
@@ -136,11 +143,18 @@ drift.backbone.queue("q").push(m); drift.backbone.queue("q").pop()
 drift.backbone.blob.put("k", data); drift.backbone.blob.get("k")
 drift.backbone.lock.acquire("r", ttl=30); drift.backbone.lock.release("r", token)
 db = drift.backbone.sql("clinic"); db.query("SELECT …", args)  # .execute(…), .begin()
-drift.backbone.jwt.issue({"sub": "alice"}); drift.backbone.jwt.verify(tok)      # raises drift.JWTError
 drift.backbone.realtime.channel("events").publish(msg)        # fan-out → WS subscribers at /realtime/events; .presence()
-drift.backbone.keyauth.challenge(pubkey); drift.backbone.keyauth.verify(pubkey, sig, "my-app")
-drift.backbone.vault.put(uid, blob); drift.backbone.vault.get(uid)
-# Top-level (NOT Backbone) — cross-slice networking + utilities:
+```
+
+**Deed** — identity, a peer pillar, not Backbone (`drift.deed.*`)
+```python
+drift.deed.keyauth.challenge(pubkey); drift.deed.keyauth.verify(pubkey, sig, "my-app")
+drift.deed.jwt.issue({"sub": "alice"}); drift.deed.jwt.verify(tok)              # raises drift.JWTError
+drift.deed.vault.put(uid, blob); drift.deed.vault.get(uid)                     # zero-knowledge recovery store, dedicated routes
+drift.deed.link.begin(pubkey); drift.deed.link.attest(identity, sid, attesting_pubkey, sig)
+drift.deed.link.complete(sid); drift.deed.link.revoke(identity, target_pubkey, revoking_pubkey, sig)
+drift.deed.pocket.set(token, "k", blob); drift.deed.pocket.get(token, "k")     # every call takes the bearer token explicitly
+# Top-level (NOT Backbone, NOT Deed) — cross-slice networking + utilities:
 drift.slice("c12").post("/api/events", body); drift.slice("c12").get("/x")
 drift.caller_slice(req)
 drift.log("msg"); drift.http_request("GET", url, timeout=30)
@@ -172,11 +186,18 @@ await drift.backbone.queue("q").push(m); await drift.backbone.queue("q").pop();
 await drift.backbone.blob.put("k", data); await drift.backbone.blob.get("k");
 await drift.backbone.lock.acquire("r", 30); await drift.backbone.lock.release("r", token);
 const db = drift.backbone.sql("clinic"); await db.query("SELECT …", args);   // .execute(…), .begin()
-await drift.backbone.jwt.issue({ sub: "alice" }); await drift.backbone.jwt.verify(tok);   // throws drift.JWTError
 await drift.backbone.realtime.channel("events").publish(msg); // fan-out → WS subscribers at /realtime/events; .presence()
-await drift.backbone.keyauth.challenge(pubkey); await drift.backbone.keyauth.verify(pubkey, sig, "my-app");
-await drift.backbone.vault.put(uid, blob); await drift.backbone.vault.get(uid);
-// Top-level (NOT Backbone) — cross-slice networking + utilities:
+```
+
+**Deed** — identity, a peer pillar, not Backbone (`drift.deed.*`; calls are `async` — `await` them)
+```js
+await drift.deed.keyauth.challenge(pubkey); await drift.deed.keyauth.verify(pubkey, sig, "my-app");
+await drift.deed.jwt.issue({ sub: "alice" }); await drift.deed.jwt.verify(tok);   // throws drift.JWTError
+await drift.deed.vault.put(uid, blob); await drift.deed.vault.get(uid);          // zero-knowledge recovery store, dedicated routes
+await drift.deed.link.begin(pubkey); await drift.deed.link.attest(identity, sid, attestingPubkey, sig);
+await drift.deed.link.complete(sid); await drift.deed.link.revoke(identity, targetPubkey, revokingPubkey, sig);
+await drift.deed.pocket.set(token, "k", blob); await drift.deed.pocket.get(token, "k");  // every call takes the bearer token explicitly
+// Top-level (NOT Backbone, NOT Deed) — cross-slice networking + utilities:
 await drift.slice("c12").post("/api/events", body); await drift.slice("c12").get("/x");
 drift.callerSlice(req);
 drift.log("msg"); await drift.httpRequest("GET", url);                  // { timeoutMs } 5th arg
@@ -208,11 +229,18 @@ Drift::Backbone.queue("q").push(m); Drift::Backbone.queue("q").pop
 Drift::Backbone::Blob.put("k", data, content_type: "image/png"); Drift::Backbone::Blob.get("k")
 Drift::Backbone::Lock.acquire("r", ttl: 30); Drift::Backbone::Lock.release("r", token)
 db = Drift::Backbone.sql("clinic"); db.query("SELECT …", args)   # .execute(…), .transaction { |tx| … }
-Drift::Backbone::JWT.issue(sub: "alice", exp: Time.now.to_i + 3600); Drift::Backbone::JWT.verify(tok)   # raises Drift::JWTError
 Drift::Backbone::Realtime.channel("events").publish(msg)      # fan-out → WS subscribers at /realtime/events; .presence
-Drift::Backbone::KeyAuth.challenge(pubkey); Drift::Backbone::KeyAuth.verify(pubkey, sig, "my-app")
-Drift::Backbone::Vault.put(uid, blob); Drift::Backbone::Vault.get(uid)
-# Top-level (NOT Backbone) — cross-slice networking + utilities:
+```
+
+**Deed** — identity, a peer pillar, not Backbone (`Drift::Deed::*`)
+```ruby
+Drift::Deed::KeyAuth.challenge(pubkey); Drift::Deed::KeyAuth.verify(pubkey, sig, "my-app")
+Drift::Deed::JWT.issue(sub: "alice", exp: Time.now.to_i + 3600); Drift::Deed::JWT.verify(tok)   # raises Drift::DeedError
+Drift::Deed::Vault.put(uid, blob); Drift::Deed::Vault.get(uid)                 # zero-knowledge recovery store, dedicated routes
+Drift::Deed::Link.begin(pubkey); Drift::Deed::Link.attest(identity, sid, attesting_pubkey, sig)
+Drift::Deed::Link.complete(sid); Drift::Deed::Link.revoke(identity, target_pubkey, revoking_pubkey, sig)
+Drift::Deed::Pocket.set(token, "k", blob); Drift::Deed::Pocket.get(token, "k")  # every call takes the bearer token explicitly
+# Top-level (NOT Backbone, NOT Deed) — cross-slice networking + utilities:
 Drift.slice("c12").post("/api/events", body); Drift.slice("c12").get("/x")
 Drift.caller_slice(req)
 Drift.log("msg"); Drift.http_request("GET", url, timeout: 30)
@@ -247,11 +275,18 @@ $c->insert($doc); $c->get($id); $c->read($key); $c->list($filter); $c->delete($k
 \Drift\Backbone\Blob::put('k', $data); \Drift\Backbone\Blob::get('k');
 \Drift\Backbone\Lock::acquire('r', 30); \Drift\Backbone\Lock::release('r', $token);
 $db = \Drift\Backbone\sql('clinic'); $db->query('SELECT …', $args);   // ->execute(…), ->transaction(fn($tx)=>…)
-\Drift\Backbone\JWT::issue(['sub' => 'alice']); \Drift\Backbone\JWT::verify($tok);   // throws \Drift\JWTError
 \Drift\Backbone\Realtime::channel('events')->publish($msg);   // fan-out → WS subscribers at /realtime/events; ->presence()
-\Drift\Backbone\KeyAuth::challenge($pubkey); \Drift\Backbone\KeyAuth::verify($pubkey, $sig, 'my-app');
-\Drift\Backbone\Vault::put($uid, $blob); \Drift\Backbone\Vault::get($uid);
-// Top-level (NOT Backbone) — cross-slice networking + utilities:
+```
+
+**Deed** — identity, a peer pillar, not Backbone (`\Drift\Deed\…`)
+```php
+\Drift\Deed\KeyAuth::challenge($pubkey); \Drift\Deed\KeyAuth::verify($pubkey, $sig, 'my-app');
+\Drift\Deed\JWT::issue(['sub' => 'alice']); \Drift\Deed\JWT::verify($tok);     // throws \Drift\JWTError
+\Drift\Deed\Vault::put($uid, $blob); \Drift\Deed\Vault::get($uid);            // zero-knowledge recovery store, dedicated routes
+\Drift\Deed\Link::begin($pubkey); \Drift\Deed\Link::attest($identity, $sid, $attestingPubkey, $sig);
+\Drift\Deed\Link::complete($sid); \Drift\Deed\Link::revoke($identity, $targetPubkey, $revokingPubkey, $sig);
+\Drift\Deed\Pocket::set($token, 'k', $blob); \Drift\Deed\Pocket::get($token, 'k');   // list_keys($token) — `list` is a PHP language construct
+// Top-level (NOT Backbone, NOT Deed) — cross-slice networking + utilities:
 \Drift\slice('c12')->post('/api/events', $body); \Drift\slice('c12')->get('/x');
 \Drift\caller_slice($req);
 \Drift\log('msg'); \Drift\http_request('GET', $url);
@@ -281,7 +316,7 @@ pub fn queue_validator(body: Value, _req: Value) -> (i64, &'static str, Value) {
 
 **Backbone** — the sole entrypoint for state (`drift_sdk::backbone::*`)
 ```rust
-use drift_sdk::backbone::{secret, cache, nosql, queue, blob, lock, jwt, sql, realtime, keyauth, vault};
+use drift_sdk::backbone::{secret, cache, nosql, queue, blob, lock, sql, realtime};
 secret::get("API_KEY");                                       // set(k, v), delete(k)
 let c = nosql::collection("orders");
 c.insert(doc); c.get(id); c.read(key); c.list(Some(filter)); c.delete(key); c.drop();
@@ -290,11 +325,19 @@ queue("q").push(m); queue("q").pop();
 blob::put("k", &data, Some("image/png")); blob::get("k");
 lock::acquire("r", 30); lock::release("r", &token);
 let db = sql("clinic"); db.query("SELECT …", &args);         // .execute(…), .begin()
-jwt::issue(claims); jwt::verify(&tok, None, None);           // -> Result<Value, jwt::JWTError>
 realtime::channel("events").publish(msg);                    // fan-out → WS subscribers at /realtime/events; .presence()
+```
+
+**Deed** — identity, a peer pillar, not Backbone (`drift_sdk::deed::*`)
+```rust
+use drift_sdk::deed::{keyauth, jwt, vault, link, pocket};
 keyauth::challenge(&pubkey); keyauth::verify(&pubkey, &sig, "my-app");
-vault::put(uid, blob); vault::get(uid);
-// Top-level (NOT Backbone) — cross-slice networking + utilities:
+jwt::issue(claims); jwt::verify(&tok, None, None);                     // -> Result<Value, jwt::JWTError>
+vault::put(uid, blob); vault::get(uid);                                // zero-knowledge recovery store, dedicated routes -> Result<_, deed::DeedError>
+link::begin(&pubkey); link::attest(&identity, &sid, &attesting_pubkey, &sig);
+link::complete(&sid); link::revoke(&identity, &target_pubkey, &revoking_pubkey, &sig);
+pocket::set(&token, "k", blob); pocket::get(&token, "k");              // every call takes the bearer token explicitly
+// Top-level (NOT Backbone, NOT Deed) — cross-slice networking + utilities:
 drift_sdk::slice("c12").post("/api/events", Some(body)); drift_sdk::slice("c12").get("/x");
 drift_sdk::caller_slice(&req);
 drift_sdk::log("msg"); drift_sdk::http_request("GET", url, None, None);
@@ -316,4 +359,4 @@ MIT — see [`LICENSE`](LICENSE).
 
 ---
 
-*This is the single source of truth for all six SDKs. Any change to the public API surface of any language MUST update the matching section above in the same change. Last verified 2026-06-27 — all six languages namespaced under `Backbone` (sole entrypoint for state) with Realtime + KeyAuth + Vault, plus top-level slice-link.*
+*This is the single source of truth for all six SDKs. Any change to the public API surface of any language MUST update the matching section above in the same change. Last verified 2026-07-15 — all six languages namespaced under `Backbone` (sole entrypoint for state: Secret/NoSQL/Cache/Queue/Blob/Lock/SQL/Realtime) and the parallel `Deed` (identity: KeyAuth/JWT/Vault/Link/Pocket — a peer pillar, not a Backbone primitive), plus top-level slice-link.*

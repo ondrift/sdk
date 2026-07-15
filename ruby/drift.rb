@@ -3,14 +3,20 @@
 # This single-file SDK provides:
 #   - Drift.run(handler): Entry point that dispatches to deployed or local mode.
 #   - Drift::Backbone — the B of the sacred A·B·C triad; the SOLE entrypoint for
-#     every STATE primitive: Secret, Cache, Nosql, queue, Blob, Lock, JWT, sql,
-#     Realtime, KeyAuth, Vault. (There is no top-level Drift::Secret etc. — go
-#     through Drift::Backbone.)
+#     every STATE primitive: Secret, Cache, Nosql, queue, Blob, Lock, sql,
+#     Realtime. (There is no top-level Drift::Secret etc. — go through
+#     Drift::Backbone.)
+#   - Drift::Deed — identity, verified. The fourth pillar alongside Atomic /
+#     Backbone / Canvas: KeyAuth, JWT, Vault, Link, Pocket. Not to be confused
+#     with Drift.slice(name) below (inter-slice networking) -- Deed::Link
+#     enrolls another DEVICE for one identity; it has nothing to do with
+#     calling another SLICE.
 #   - Drift.log(msg): Writes to stderr (captured by the runner as function logs).
 #   - Drift.http_request(): Outbound HTTP from within a function.
 #   - Drift.slice(name) / Drift.caller_slice(req): slice-to-slice linking.
 #
-# All backbone helpers use only stdlib (net/http) -- zero external dependencies.
+# All backbone/deed helpers use only stdlib (net/http) -- zero external
+# dependencies.
 
 require 'json'
 require 'net/http'
@@ -104,11 +110,25 @@ module Drift
     @backbone_url ||= ENV['BACKBONE_URL'] || ''
   end
 
-  # _backbone_http issues a request to the backbone over TCP
-  # (BACKBONE_URL=http://host:port). Returns [status_code, body].
-  # Stdlib only — Net::HTTP.
-  def self._backbone_http(method, path, body, content_type)
-    base = _get_backbone_url
+  @deed_url = nil
+
+  # Deed has its own listener/port now (DEED_URL), separate from
+  # Backbone's -- see _call_deed/_call_deed_auth below.
+  def self._get_deed_url
+    @deed_url ||= ENV['DEED_URL'] || ''
+  end
+
+  # _backbone_http issues a request over TCP (Net::HTTP opens a fresh
+  # connection per call, so no persistent-connection thrashing concern
+  # between different hosts/ports). Returns [status_code, body]. Stdlib
+  # only — Net::HTTP. `base:` defaults to Backbone's URL; _call_deed/
+  # _call_deed_auth pass Deed's own URL instead, since Deed lives on a
+  # separate port. `token:`, when given, sets an Authorization: Bearer
+  # header -- the one call shape that needs it (Drift::Deed::Pocket, whose
+  # routes are JWT-gated; see _call_deed_auth below). Every other caller
+  # omits it.
+  def self._backbone_http(method, path, body, content_type, token: nil, base: nil)
+    base ||= _get_backbone_url
     uri = URI("#{base}/#{path}")
     http = Net::HTTP.new(uri.host, uri.port)
     http.use_ssl = uri.scheme == 'https'
@@ -117,13 +137,24 @@ module Drift
       req['Content-Type'] = content_type
       req.body = body
     end
+    req['Authorization'] = "Bearer #{token}" if token
     resp = http.request(req)
     [resp.code.to_i, resp.body]
+  end
+
+  # Raises Drift::BackboneError on any non-2xx response -- shared by _call
+  # and _call_raw (see BackboneError's doc comment above for why).
+  def self._check_backbone_status!(code, resp_body, path)
+    return unless code && code >= 400
+    msg = resp_body.to_s.strip
+    msg = "HTTP #{code}" if msg.empty?
+    raise BackboneError, "drift: backbone #{path}: #{msg}"
   end
 
   def self._call(method, path, body = nil)
     return _call_local(method, path, body) if _get_backbone_url.empty?
     code, resp_body = _backbone_http(method, path, body ? JSON.generate(body) : nil, 'application/json')
+    _check_backbone_status!(code, resp_body, path)
     return nil if code == 204 || resp_body.nil? || resp_body.empty?
     begin
       JSON.parse(resp_body)
@@ -135,7 +166,52 @@ module Drift
   def self._call_raw(method, path, data_bytes, content_type = 'application/octet-stream')
     return nil if _get_backbone_url.empty?
     code, resp_body = _backbone_http(method, path, data_bytes, content_type)
-    (code && code >= 200 && code < 300) ? resp_body : nil
+    _check_backbone_status!(code, resp_body, path)
+    resp_body
+  end
+
+  # _call_deed / _call_deed_auth back Drift::Deed's Vault/Link/Pocket calls.
+  # Unlike the general _call above (which never inspects the HTTP status
+  # code at all -- see its comment), these raise Drift::DeedError on any
+  # non-2xx response, mirroring the Go SDK's callBackboneHTTP: a 404 body
+  # is an ERROR, not data, so e.g. Vault.get on an unwritten uid fails
+  # loudly instead of silently returning nil. There's no in-memory
+  # local-dev backing store for deed/* routes (none of the local-only
+  # stubs in _call_local below handle them), so in local dev
+  # fire-and-forget writes (Vault.put, Link.begin/attest/revoke) are
+  # harmless no-ops, while accessor calls (Vault.get, Link.complete) fall
+  # back to whatever their own not-a-Hash guard returns.
+  def self._deed_response(code, resp_body, path)
+    if code && code >= 400
+      msg = resp_body.to_s.strip
+      msg = "HTTP #{code}" if msg.empty?
+      raise DeedError, "drift: deed #{path}: #{msg}"
+    end
+    return nil if code == 204 || resp_body.nil? || resp_body.empty?
+    begin
+      JSON.parse(resp_body)
+    rescue JSON::ParserError
+      resp_body
+    end
+  end
+
+  def self._call_deed(method, path, body = nil)
+    return nil if _get_deed_url.empty?
+    code, resp_body = _backbone_http(method, path, body ? JSON.generate(body) : nil, 'application/json', base: _get_deed_url)
+    _deed_response(code, resp_body, path)
+  end
+
+  # _call_deed_auth is _call_deed with a bearer token attached -- used only
+  # by Deed::Pocket, whose routes are JWT-gated (unlike every other
+  # loopback-open Backbone/Deed primitive). Local dev has no JWT
+  # verification to check a token against, so -- same as KeyAuth/JWT
+  # already -- Pocket simply isn't available without a running slice.
+  def self._call_deed_auth(method, path, token, body = nil)
+    if _get_deed_url.empty?
+      raise DeedError, 'drift: deed pocket requires a running slice (DEED_URL) -- not available in local dev'
+    end
+    code, resp_body = _backbone_http(method, path, body ? JSON.generate(body) : nil, 'application/json', token: token, base: _get_deed_url)
+    _deed_response(code, resp_body, path)
   end
 
   # In-memory backbone for local dev.
@@ -243,7 +319,7 @@ module Drift
     nil
   end
 
-  # Raised by Drift::Backbone::JWT.verify on validation failure. `reason` is one
+  # Raised by Drift::Deed::JWT.verify on validation failure. `reason` is one
   # of the stable wire strings: malformed, bad_signature, expired, not_yet_valid,
   # wrong_algorithm, wrong_issuer, wrong_audience, invalid_claims, missing_exp,
   # internal_error. Kept top-level (it is an error type, not a state entrypoint).
@@ -254,6 +330,22 @@ module Drift
       @reason = reason
     end
   end
+
+  # Raised by Drift::Deed's Vault/Link/Pocket calls on a non-2xx HTTP response
+  # from a Deed route -- e.g. Vault.get/Pocket.get on a uid/key that never
+  # wrote anything propagate the 404 as this error rather than returning nil
+  # (see their doc comments). Kept top-level for the same reason as JWTError:
+  # it is an error type, not a state/identity entrypoint.
+  class DeedError < StandardError; end
+
+  # Raised by any Backbone call (Secret, Cache, NoSQL, Queue, Blob, Lock, SQL,
+  # Realtime) on a non-2xx HTTP response -- a 404/409/etc body is an ERROR,
+  # not data, matching the Go SDK's callBackboneHTTP and Deed's DeedError
+  # above. In particular a "not found" Get (Secret.get on an undeclared name,
+  # Blob.get on an unwritten key, NoSQL Collection#read on an unknown key) now
+  # raises instead of silently returning nil -- the same convention as every
+  # other language's SDK.
+  class BackboneError < StandardError; end
 
   # ===========================================================================
   # Backbone — the B of the sacred A·B·C triad. The SOLE entrypoint for every
@@ -412,7 +504,8 @@ module Drift
         return nil if Drift._get_backbone_url.empty?
         path = "blob/get?bucket=#{URI.encode_www_form_component(bucket)}&key=#{URI.encode_www_form_component(key)}"
         code, body = Drift._backbone_http('GET', path, nil, nil)
-        (code && code >= 200 && code < 300) ? body : nil
+        Drift._check_backbone_status!(code, body, path)
+        body
       end
     end
 
@@ -428,53 +521,6 @@ module Drift
 
       def self.release(name, token)
         Drift._call('POST', 'lock/release', { 'name' => name, 'token' => token })
-      end
-    end
-
-    # -------------------------------------------------------------------------
-    # JWT primitive
-    # -------------------------------------------------------------------------
-    #
-    # HS256 minting + verification, signed with the slice's per-slice JKey. The
-    # signing key never leaves the slice's backbone process; all operations flow
-    # through loopback HTTP to backbone /jwt/{sign,verify,slice-id}.
-    #
-    # Design: internal/todo/slice-jwt-primitive.md.
-
-    module JWT
-      # Sign a JWT with the slice's HS256 JKey. `exp` is required; `iat`,
-      # `iss`, and `jti` are auto-set when nil. `custom` is a hash of
-      # app-specific claims that the platform never inspects.
-      def self.issue(sub: nil, exp: nil, iat: nil, nbf: nil, iss: nil, aud: nil, jti: nil, custom: nil)
-        body = {}
-        body['sub']    = sub    unless sub.nil?
-        body['exp']    = exp    unless exp.nil?
-        body['iat']    = iat    unless iat.nil?
-        body['nbf']    = nbf    unless nbf.nil?
-        body['iss']    = iss    unless iss.nil?
-        body['aud']    = aud    unless aud.nil?
-        body['jti']    = jti    unless jti.nil?
-        body['custom'] = custom unless custom.nil?
-        resp = Drift._call('POST', 'jwt/sign', body)
-        (resp || {})['token']
-      end
-
-      # Validate a token. Returns the parsed claims hash on success;
-      # raises Drift::JWTError on validation failure.
-      def self.verify(token, audience: nil, allowed_issuer: nil)
-        body = { 'token' => token }
-        body['audience']       = audience       unless audience.nil?
-        body['allowed_issuer'] = allowed_issuer unless allowed_issuer.nil?
-        resp = Drift._call('POST', 'jwt/verify', body)
-        raise JWTError.new('internal_error') unless resp.is_a?(Hash)
-        raise JWTError.new(resp['reason'] || 'internal_error') unless resp['valid']
-        resp['claims'] || {}
-      end
-
-      # The slice's auto-set issuer string ("drift-slice-<user>-<slice>").
-      def self.slice_id
-        resp = Drift._call('GET', 'jwt/slice-id')
-        resp.is_a?(Hash) ? (resp['slice_id'] || '') : ''
       end
     end
 
@@ -510,6 +556,35 @@ module Drift
     end
 
     # -------------------------------------------------------------------------
+    # SQL — per-slice SQLite databases.
+    # -------------------------------------------------------------------------
+
+    def self.sql(name)
+      Drift::SqlDb.new(name)
+    end
+  end
+
+  # ===========================================================================
+  # Deed — identity, verified. The fourth pillar alongside Atomic / Backbone /
+  # Canvas -- a peer subsystem, not a Backbone primitive, with its own
+  # loopback listener (DEED_URL) separate from Backbone's (BACKBONE_URL).
+  #
+  #   Drift::Deed::KeyAuth / JWT / Vault / Link / Pocket
+  #
+  # KeyAuth: passwordless Ed25519 device-key auth. JWT: general-purpose HS256
+  # sign/verify (KeyAuth mints its own tokens through it). Vault: an
+  # account-key-wrapped keyring. Link: multi-device attestation / enrollment /
+  # revocation. Pocket: E2EE per-identity app data, JWT-gated.
+  #
+  # Not to be confused with cross-slice calling (Drift.slice(name) /
+  # Drift.caller_slice, further below) -- that's inter-slice networking, an
+  # unrelated concept. Deed::Link enrolls another DEVICE for the same
+  # identity; it has nothing to do with calling another SLICE.
+  # ===========================================================================
+
+  module Deed
+
+    # -------------------------------------------------------------------------
     # KeyAuth — passwordless Ed25519 device-key auth.
     # -------------------------------------------------------------------------
     #
@@ -520,57 +595,195 @@ module Drift
 
     module KeyAuth
       def self.challenge(pubkey)
-        resp = Drift._call('POST', 'keyauth/challenge', { 'pubkey' => pubkey })
+        resp = Drift._call_deed('POST', 'keyauth/challenge', { 'pubkey' => pubkey })
         resp.is_a?(Hash) ? (resp['nonce'] || '') : ''
       end
 
       def self.verify(pubkey, sig, domain)
-        resp = Drift._call('POST', 'keyauth/verify', { 'pubkey' => pubkey, 'sig' => sig, 'domain' => domain })
+        resp = Drift._call_deed('POST', 'keyauth/verify', { 'pubkey' => pubkey, 'sig' => sig, 'domain' => domain })
         resp.is_a?(Hash) ? (resp['token'] || '') : ''
       end
     end
 
     # -------------------------------------------------------------------------
-    # Vault — zero-knowledge recovery store (Layer B).
+    # JWT — general-purpose HS256 sign/verify.
     # -------------------------------------------------------------------------
     #
-    # User-scoped, append-only, opaque. The client encrypts the blob under a key
-    # the slice never sees. Backed by the `keyvault` NoSQL collection (declare it
-    # in your Driftfile).
+    # Signed with the slice's per-slice JKey. The signing key never leaves the
+    # slice's backbone process; all operations flow through loopback HTTP to
+    # backbone /jwt/{sign,verify,slice-id}. KeyAuth mints its own session
+    # tokens through this same primitive.
+    #
+    # Design: internal/todo/slice-jwt-primitive.md.
 
-    module Vault
-      def self.put(uid, blob)
-        nanos = Process.clock_gettime(Process::CLOCK_MONOTONIC, :nanosecond)
-        Nosql.collection('keyvault').insert({
-          '_id' => "#{uid}:#{nanos}",
-          'user_id' => uid,
-          'blob' => blob,
-          'updated_at' => Time.now.to_i,
-        })
+    module JWT
+      # Sign a JWT with the slice's HS256 JKey. `exp` is required; `iat`,
+      # `iss`, and `jti` are auto-set when nil. `custom` is a hash of
+      # app-specific claims that the platform never inspects.
+      def self.issue(sub: nil, exp: nil, iat: nil, nbf: nil, iss: nil, aud: nil, jti: nil, custom: nil)
+        body = {}
+        body['sub']    = sub    unless sub.nil?
+        body['exp']    = exp    unless exp.nil?
+        body['iat']    = iat    unless iat.nil?
+        body['nbf']    = nbf    unless nbf.nil?
+        body['iss']    = iss    unless iss.nil?
+        body['aud']    = aud    unless aud.nil?
+        body['jti']    = jti    unless jti.nil?
+        body['custom'] = custom unless custom.nil?
+        resp = Drift._call_deed('POST', 'jwt/sign', body)
+        (resp || {})['token']
       end
 
-      def self.get(uid)
-        rows = Nosql.collection('keyvault').list({ 'user_id' => uid })
-        best_at = -1
-        best = nil
-        rows.each do |r|
-          next unless r.is_a?(Hash)
-          at = r['updated_at'] || 0
-          if at >= best_at
-            best_at = at
-            best = r['blob']
-          end
-        end
-        best
+      # Validate a token. Returns the parsed claims hash on success;
+      # raises Drift::JWTError on validation failure.
+      def self.verify(token, audience: nil, allowed_issuer: nil)
+        body = { 'token' => token }
+        body['audience']       = audience       unless audience.nil?
+        body['allowed_issuer'] = allowed_issuer unless allowed_issuer.nil?
+        resp = Drift._call_deed('POST', 'jwt/verify', body)
+        raise JWTError.new('internal_error') unless resp.is_a?(Hash)
+        raise JWTError.new(resp['reason'] || 'internal_error') unless resp['valid']
+        resp['claims'] || {}
+      end
+
+      # The slice's auto-set issuer string ("drift-slice-<user>-<slice>").
+      def self.slice_id
+        resp = Drift._call_deed('GET', 'jwt/slice-id')
+        resp.is_a?(Hash) ? (resp['slice_id'] || '') : ''
       end
     end
 
     # -------------------------------------------------------------------------
-    # SQL — per-slice SQLite databases.
+    # Vault — zero-knowledge recovery store.
     # -------------------------------------------------------------------------
+    #
+    # Opaque, user-scoped, append-only. The client encrypts the blob under a
+    # key derived from its recovery phrase (which the slice NEVER sees), so
+    # Drift stores the backup but cannot read it. Scoped to a uid the caller
+    # supplies -- typically the authenticated KeyAuth pubkey. Backed by Deed's
+    # own dedicated routes (deed/vault/*) -- no Driftfile declaration needed,
+    # and no generic-NoSQL-collection scan behind it any more.
 
-    def self.sql(name)
-      Drift::SqlDb.new(name)
+    module Vault
+      # Append an opaque encrypted backup blob for uid. Append-only -- a new
+      # version each call; get returns the newest.
+      def self.put(uid, blob)
+        Drift._call_deed('POST', 'deed/vault/put', { 'uid' => uid, 'blob' => blob })
+      end
+
+      # Return the most recent backup blob for uid. Raises Drift::DeedError if
+      # uid has never written one (same "not found is an error" convention
+      # observed by the other Deed accessors below -- see Pocket.get).
+      def self.get(uid)
+        resp = Drift._call_deed('GET', "deed/vault/get?uid=#{URI.encode_www_form_component(uid)}")
+        raise DeedError, "drift: vault get: no blob for uid #{uid.inspect}" unless resp.is_a?(Hash)
+        resp['blob']
+      end
+    end
+
+    # -------------------------------------------------------------------------
+    # Link — multi-device continuity.
+    # -------------------------------------------------------------------------
+    #
+    # Generalizes the enroll/attest/revoke pattern so an identity's KeyAuth
+    # session can move to a second, third, ... device. The signature
+    # parameters below (sig, attesting_pubkey, etc.) are produced entirely
+    # client-side -- this SDK only forwards them, the same way KeyAuth.verify
+    # forwards a signature it never computes itself. The one rule the whole
+    # design rests on: Deed verifies, it never decides -- a device is only
+    # ever added on the strength of a signature from a device already active
+    # in the identity's registry.
+    #
+    # Not to be confused with Drift.slice(name)/Drift.caller_slice further
+    # below -- this Link enrolls a DEVICE for one identity, it does not call
+    # another slice.
+
+    module Link
+      # Start a device-linking session for a not-yet-enrolled device's
+      # pubkey (usually carried in a QR code alongside the pubkey). Returns
+      # a session ID for an already-active device to present to attest.
+      #
+      # Named `begin`, not `start`, to track the wire route 1:1 -- `begin`
+      # compiles fine as a plain method name given an explicit receiver
+      # (it's a reserved word only in expression position); Drift::SqlDb#begin
+      # elsewhere in this file is the same precedent already in production.
+      def self.begin(pubkey)
+        resp = Drift._call_deed('POST', 'deed/link/begin', { 'pubkey' => pubkey })
+        resp.is_a?(Hash) ? (resp['session_id'] || '') : ''
+      end
+
+      # Have an already-active device vouch for the session's pending
+      # device. `sig` is the client's signature over the canonical
+      # {domain,identity,new_pubkey} message -- computed client-side, never
+      # by this SDK.
+      def self.attest(identity, session_id, attesting_pubkey, sig)
+        Drift._call_deed('POST', 'deed/link/attest', {
+          'identity' => identity, 'session_id' => session_id,
+          'attesting_pubkey' => attesting_pubkey, 'sig' => sig,
+        })
+      end
+
+      # Poll a session the new device started with begin, returning whether
+      # an active device has attested it yet:
+      # { 'status' => ..., 'identity' => ... } -- 'identity' is only set
+      # once status == "attested".
+      def self.complete(session_id)
+        resp = Drift._call_deed('POST', 'deed/link/complete', { 'session_id' => session_id })
+        resp.is_a?(Hash) ? resp : {}
+      end
+
+      # Deactivate target_pubkey in identity's device registry. Any
+      # currently-active device may revoke another (or itself);
+      # revoking_pubkey is the device doing the revoking, sig its signature
+      # over the canonical {domain,identity,target_pubkey} message.
+      def self.revoke(identity, target_pubkey, revoking_pubkey, sig)
+        Drift._call_deed('POST', 'deed/link/revoke', {
+          'identity' => identity, 'target_pubkey' => target_pubkey,
+          'revoking_pubkey' => revoking_pubkey, 'sig' => sig,
+        })
+      end
+    end
+
+    # -------------------------------------------------------------------------
+    # Pocket — E2EE per-identity app data.
+    # -------------------------------------------------------------------------
+    #
+    # An app's actual data -- content-keyed, following an identity across
+    # every device Link has enrolled. The crypto work happens entirely
+    # client-side before anything reaches this primitive; Pocket never
+    # encrypts or decrypts the payload itself. Every call takes token
+    # explicitly (the JWT KeyAuth.verify returned) rather than holding
+    # hidden session state -- matching the rest of this SDK's stateless
+    # posture inside an Atomic function invocation. The token's sub is the
+    # only identity a call can read or write under; there is no way to name
+    # a different one.
+
+    module Pocket
+      # Store blob under key for whichever identity token resolves to.
+      def self.set(token, key, blob)
+        Drift._call_deed_auth('POST', 'deed/pocket/set', token, { 'key' => key, 'blob' => blob })
+      end
+
+      # Return the blob stored under key for token's identity. Raises
+      # Drift::DeedError if no such key exists.
+      def self.get(token, key)
+        resp = Drift._call_deed_auth('GET', "deed/pocket/get?key=#{URI.encode_www_form_component(key)}", token)
+        raise DeedError, "drift: pocket get: no blob for key #{key.inspect}" unless resp.is_a?(Hash)
+        resp['blob']
+      end
+
+      # Remove key for token's identity. Raises Drift::DeedError if no such
+      # key exists.
+      def self.delete(token, key)
+        Drift._call_deed_auth('POST', 'deed/pocket/delete', token, { 'key' => key })
+      end
+
+      # Return every key stored under token's identity -- never another
+      # identity's, even by guessing.
+      def self.list(token)
+        resp = Drift._call_deed_auth('GET', 'deed/pocket/list', token)
+        resp.is_a?(Array) ? resp : []
+      end
     end
   end
 
@@ -737,11 +950,13 @@ module Drift
   end
 
   # ---------------------------------------------------------------------------
-  # Slice-to-slice linking (top-level; the seed of a future "D" pillar)
+  # Slice-to-slice linking (top-level; unrelated to Drift::Deed::Link)
   # ---------------------------------------------------------------------------
   #
-  # Not Backbone — this is inter-slice networking, parked at the top level until
-  # the fourth pillar lands.
+  # Not Backbone, and NOT Deed — this is inter-slice networking: one slice
+  # calling another slice it's linked to. Drift::Deed::Link (above) is a
+  # different thing entirely: it enrolls another DEVICE under the same
+  # identity. Same English word, unrelated concepts -- don't conflate them.
 
   def self._link_env_name(name)
     'DRIFT_LINK_' + name.upcase.gsub(/[^A-Z0-9]/, '_') + '_URL'
