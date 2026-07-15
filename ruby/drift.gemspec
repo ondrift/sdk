@@ -1,6 +1,6 @@
 Gem::Specification.new do |spec|
   spec.name          = "drift-sdk"
-  spec.version       = "4.0.0"
+  spec.version       = "4.0.1"
   spec.authors       = ["Drift"]
 
   spec.summary       = "Drift SDK for Ruby Atomic functions"

@@ -22,13 +22,13 @@ The SDK is what user-written code imports to talk to [Drift](https://ondrift.eu)
 No version is pinned anywhere — reference the SDK unversioned and every build tracks the latest tag.
 
 ```bash
-# Go — name the ROOT module (NOT …/sdk/v3/go: the repo's early history had a
+# Go — name the ROOT module (NOT …/sdk/v4/go: the repo's early history had a
 # nested …/sdk/go module whose stale pseudo-versions still resolve first).
-# The /v3 segment is Go's own semantic-import-versioning rule for a v2+
-# module — a plain `github.com/ondrift/sdk@latest` (no /v3) stays on the v1
+# The /v4 segment is Go's own semantic-import-versioning rule for a v2+
+# module — a plain `github.com/ondrift/sdk@latest` (no /v4) stays on the v1
 # line forever, by design: existing v1 consumers never see a breaking change
 # land under their feet.
-go get github.com/ondrift/sdk/v3@latest      # then: import drift "github.com/ondrift/sdk/v3/go"
+go get github.com/ondrift/sdk/v4@latest      # then: import drift "github.com/ondrift/sdk/v4/go"
 ```
 ```text
 # Python (requirements.txt)
@@ -76,7 +76,7 @@ The Backbone and Deed primitives are each identical across languages; every sect
 ### Go
 
 ```go
-import drift "github.com/ondrift/sdk/v3/go"
+import drift "github.com/ondrift/sdk/v4/go"
 ```
 
 ```go
