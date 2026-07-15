@@ -433,11 +433,13 @@ func callBackboneLocal(method, path string, body any) ([]byte, error) {
 // entrypoint for every stateful primitive:
 //
 //	drift.Backbone.Secret / NoSQL / Cache / Queue / Blob / Lock /
-//	              JWT / SQL / Realtime / KeyAuth / Vault
+//	              Realtime / SQL
 //
 // Nothing stateful lives at the top level — the triad is the namespace
 // for everything under it. (Atomic-side entrypoints like Run live with
-// the runtime; cross-slice calling is the seed of a future "D".)
+// the runtime; cross-slice calling is the seed of a future "D"; identity
+// — KeyAuth/JWT/Vault/Link/Pocket — lives under Deed, below, a peer of
+// Backbone rather than one of its primitives.)
 // ================================================================
 
 type backboneNS struct {
@@ -446,10 +448,7 @@ type backboneNS struct {
 	Cache    cacheNS
 	Blob     blobNS
 	Lock     lockNS
-	JWT      jwtNS
 	Realtime realtimeNS
-	KeyAuth  keyAuthNS
-	Vault    vaultNS
 }
 
 // Backbone is the entrypoint for all Backbone (state) primitives.
@@ -470,10 +469,45 @@ type realtimeNS struct{}
 // Channel returns a handle to a realtime channel for server-side publishing.
 func (realtimeNS) Channel(name string) RealtimeChannel { return RealtimeChannel{name: name} }
 
-// keyAuthNS / vaultNS are defined here so backboneNS compiles; their methods
-// live in the KeyAuth / Vault sections below.
+// ================================================================
+// Deed — identity, verified. The fourth pillar alongside Atomic /
+// Backbone / Canvas — a peer subsystem, not a Backbone primitive, with
+// its own loopback listener (DEED_URL) separate from Backbone's
+// (BACKBONE_URL). See docs/memos/cyberpunk-shit/
+// deed-the-fourth-pillar-drift-identity.md.
+//
+//	drift.Deed.KeyAuth / JWT / Vault / Link / Pocket
+//
+// KeyAuth: passwordless Ed25519 device-key auth. JWT: general-purpose
+// HS256 sign/verify (KeyAuth mints its own tokens through it). Vault: an
+// account-key-wrapped keyring. Link: multi-device attestation /
+// enrollment / revocation. Pocket: E2EE per-identity app data, JWT-gated.
+//
+// Not to be confused with cross-slice calling (drift.Slice(name) /
+// CallerSlice, further below) — that's inter-slice networking, a
+// different, still-hypothetical future pillar. Deed.Link enrolls another
+// DEVICE for the same identity; it has nothing to do with calling
+// another SLICE.
+// ================================================================
+
+type deedNS struct {
+	KeyAuth keyAuthNS
+	JWT     jwtNS
+	Vault   vaultNS
+	Link    linkNS
+	Pocket  pocketNS
+}
+
+// Deed is the entrypoint for every identity primitive: KeyAuth, JWT,
+// Vault, Link, Pocket.
+var Deed deedNS
+
+// keyAuthNS / vaultNS / linkNS / pocketNS are defined here so deedNS
+// compiles; their methods live in the sections below.
 type keyAuthNS struct{}
 type vaultNS struct{}
+type linkNS struct{}
+type pocketNS struct{}
 
 // --- Secret ---
 
@@ -769,7 +803,7 @@ func (c RealtimeChannel) Presence() (int, error) {
 	return out.Present, nil
 }
 
-// --- KeyAuth (Backbone.KeyAuth) ---
+// --- KeyAuth (Deed.KeyAuth) ---
 //
 // Passwordless device-key auth (Ed25519). The client holds a keypair; the uid
 // IS its public key — no accounts, no passwords, no email. Challenge mints a
@@ -782,7 +816,7 @@ func (c RealtimeChannel) Presence() (int, error) {
 // Challenge returns a one-time login nonce for the given Ed25519 public key
 // (32-byte hex). Single-use, short-TTL, cache-backed in the slice.
 func (keyAuthNS) Challenge(pubkey string) (string, error) {
-	resp, err := callBackbone("POST", "keyauth/challenge", map[string]any{"pubkey": pubkey})
+	resp, err := callDeed("POST", "keyauth/challenge", map[string]any{"pubkey": pubkey})
 	if err != nil {
 		return "", err
 	}
@@ -801,7 +835,7 @@ func (keyAuthNS) Challenge(pubkey string) (string, error) {
 // one app/slice can't be replayed at another — the client must sign the same
 // domain. A bad/expired/absent challenge or a bad signature returns an error.
 func (keyAuthNS) Verify(pubkey, sig, domain string) (string, error) {
-	resp, err := callBackbone("POST", "keyauth/verify", map[string]any{
+	resp, err := callDeed("POST", "keyauth/verify", map[string]any{
 		"pubkey": pubkey, "sig": sig, "domain": domain,
 	})
 	if err != nil {
@@ -816,46 +850,245 @@ func (keyAuthNS) Verify(pubkey, sig, domain string) (string, error) {
 	return out.Token, nil
 }
 
-// --- Vault (Backbone.Vault) ---
+// --- Vault (Deed.Vault) ---
 //
 // Zero-knowledge recovery store: opaque, user-scoped, append-only. The client
 // encrypts the blob under a key derived from its recovery phrase (which the
-// slice NEVER sees), so Drift stores the backup but cannot read it. Scoped to a
-// uid the caller supplies — typically the authenticated KeyAuth pubkey. Backed
-// by NoSQL; uses the `keyvault` collection (declare it in your Driftfile).
-
-const vaultCollection = "keyvault"
+// slice NEVER sees), so Drift stores the backup but cannot read it. Scoped to
+// a uid the caller supplies — typically the authenticated KeyAuth pubkey.
+// Backed by Deed's own dedicated routes: AES-256-GCM at rest (defense in
+// depth only — the blob must already be ciphertext before it arrives, since
+// that's the actual source of Vault's confidentiality guarantee) and a
+// per-item size quota. No Driftfile declaration needed — replaces the old
+// generic-NoSQL-collection implementation entirely.
 
 // Put appends an opaque encrypted backup blob for uid. Append-only (a new
 // version each call); Get returns the newest.
 func (vaultNS) Put(uid string, blob any) error {
-	_, err := Backbone.NoSQL.Collection(vaultCollection).Insert(map[string]any{
-		"_id":        fmt.Sprintf("%s:%d", uid, time.Now().UnixNano()),
-		"user_id":    uid,
-		"blob":       blob,
-		"updated_at": time.Now().Unix(),
+	_, err := callDeed("POST", "deed/vault/put", map[string]any{"uid": uid, "blob": blob})
+	return err
+}
+
+// Get returns the most recent backup blob for uid. Returns an error if uid
+// has never written one (same "not found is an error" convention as
+// Secret.Get/Blob.Get).
+func (vaultNS) Get(uid string) (json.RawMessage, error) {
+	resp, err := callDeed("GET", "deed/vault/get?uid="+url.QueryEscape(uid), nil)
+	if err != nil {
+		return nil, err
+	}
+	var out struct {
+		Blob json.RawMessage `json:"blob"`
+	}
+	if err := json.Unmarshal(resp, &out); err != nil {
+		return nil, err
+	}
+	return out.Blob, nil
+}
+
+// --- Link (Deed.Link) ---
+//
+// Multi-device continuity: generalizes the enroll/attest/revoke pattern so
+// an identity's KeyAuth session can move to a second, third, ... device.
+// The signature parameters below (sig, attestingPubkey, etc.) are produced
+// entirely client-side — this SDK only forwards them, the same way
+// KeyAuth.Verify forwards a signature it never computes itself. The one
+// rule the whole design rests on: Deed verifies, it never decides — a
+// device is only ever added on the strength of a signature from a device
+// already active in the identity's registry.
+//
+// Not to be confused with cross-slice calling (Slice(name)/CallerSlice,
+// further below) — this Link enrolls a DEVICE for one identity, it does
+// not call another slice.
+
+// Begin starts a device-linking session for a not-yet-enrolled device's
+// pubkey (usually carried in a QR code alongside the pubkey). Returns a
+// session ID for an already-active device to present to Attest.
+func (linkNS) Begin(pubkey string) (string, error) {
+	resp, err := callDeed("POST", "deed/link/begin", map[string]any{"pubkey": pubkey})
+	if err != nil {
+		return "", err
+	}
+	var out struct {
+		SessionID string `json:"session_id"`
+	}
+	if err := json.Unmarshal(resp, &out); err != nil {
+		return "", err
+	}
+	return out.SessionID, nil
+}
+
+// Attest has an already-active device vouch for the session's pending
+// device. sig is the client's signature over the canonical
+// {domain,identity,new_pubkey} message — computed client-side, never by
+// this SDK.
+func (linkNS) Attest(identity, sessionID, attestingPubkey, sig string) error {
+	_, err := callDeed("POST", "deed/link/attest", map[string]any{
+		"identity": identity, "session_id": sessionID,
+		"attesting_pubkey": attestingPubkey, "sig": sig,
 	})
 	return err
 }
 
-// Get returns the most recent backup blob for uid, or nil if none exists.
-func (vaultNS) Get(uid string) (json.RawMessage, error) {
-	rows, err := Backbone.NoSQL.Collection(vaultCollection).List(map[string]string{"user_id": uid})
+// LinkStatus is returned by Link.Complete. Identity is set only once
+// Status == "attested".
+type LinkStatus struct {
+	Status   string `json:"status"`
+	Identity string `json:"identity,omitempty"`
+}
+
+// Complete polls a session the new device started with Begin, returning
+// whether an active device has attested it yet.
+func (linkNS) Complete(sessionID string) (LinkStatus, error) {
+	resp, err := callDeed("POST", "deed/link/complete", map[string]any{"session_id": sessionID})
+	if err != nil {
+		return LinkStatus{}, err
+	}
+	var out LinkStatus
+	if err := json.Unmarshal(resp, &out); err != nil {
+		return LinkStatus{}, err
+	}
+	return out, nil
+}
+
+// Revoke deactivates target_pubkey in identity's device registry. Any
+// currently-active device may revoke another (or itself); revokingPubkey
+// is the device doing the revoking, sig its signature over the canonical
+// {domain,identity,target_pubkey} message.
+func (linkNS) Revoke(identity, targetPubkey, revokingPubkey, sig string) error {
+	_, err := callDeed("POST", "deed/link/revoke", map[string]any{
+		"identity": identity, "target_pubkey": targetPubkey,
+		"revoking_pubkey": revokingPubkey, "sig": sig,
+	})
+	return err
+}
+
+// --- Pocket (Deed.Pocket) ---
+//
+// An app's actual data — E2EE, content-keyed, following an identity across
+// every device Link has enrolled. The crypto work happens entirely
+// client-side before anything reaches this primitive; Pocket never
+// encrypts or decrypts the payload itself. Every call takes token
+// explicitly (the JWT KeyAuth.Verify returned) rather than holding hidden
+// session state — matching the rest of this SDK's stateless posture inside
+// an Atomic function invocation. The token's sub is the only identity a
+// call can read or write under; there is no way to name a different one.
+
+// Set stores blob under key for whichever identity token resolves to.
+func (pocketNS) Set(token, key string, blob any) error {
+	_, err := callBackboneAuth("POST", "deed/pocket/set", token, map[string]any{"key": key, "blob": blob})
+	return err
+}
+
+// Get returns the blob stored under key for token's identity. Returns an
+// error if no such key exists.
+func (pocketNS) Get(token, key string) (json.RawMessage, error) {
+	resp, err := callBackboneAuth("GET", "deed/pocket/get?key="+url.QueryEscape(key), token, nil)
 	if err != nil {
 		return nil, err
 	}
-	var bestAt int64 = -1
-	var best json.RawMessage
-	for _, r := range rows {
-		var d struct {
-			Blob      json.RawMessage `json:"blob"`
-			UpdatedAt int64           `json:"updated_at"`
-		}
-		if json.Unmarshal(r, &d) == nil && d.UpdatedAt >= bestAt {
-			bestAt, best = d.UpdatedAt, d.Blob
-		}
+	var out struct {
+		Blob json.RawMessage `json:"blob"`
 	}
-	return best, nil
+	if err := json.Unmarshal(resp, &out); err != nil {
+		return nil, err
+	}
+	return out.Blob, nil
+}
+
+// Delete removes key for token's identity. Returns an error if no such key
+// exists.
+func (pocketNS) Delete(token, key string) error {
+	_, err := callBackboneAuth("POST", "deed/pocket/delete", token, map[string]any{"key": key})
+	return err
+}
+
+// List returns every key stored under token's identity — never another
+// identity's, even by guessing.
+func (pocketNS) List(token string) ([]string, error) {
+	resp, err := callBackboneAuth("GET", "deed/pocket/list", token, nil)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	if err := json.Unmarshal(resp, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// callDeed calls Deed's own listener (DEED_URL) — a separate port from
+// Backbone's (BACKBONE_URL) since Deed got its own runtime isolation. No
+// local-dev fallback: Deed.Vault and Deed.Link have no in-memory local-dev
+// implementation the way every Backbone primitive does, so silently
+// no-op'ing here (the way callBackboneLocal would for an unmatched path)
+// would report success without ever storing anything. Requiring DEED_URL
+// makes that failure honest and immediate instead, matching KeyAuth/JWT's
+// existing "not available without a running slice" precedent.
+func callDeed(method, path string, body any) ([]byte, error) {
+	baseURL := os.Getenv("DEED_URL")
+	if baseURL == "" {
+		return nil, fmt.Errorf("drift: deed requires a running slice (DEED_URL) — not available in local dev")
+	}
+	return callBackboneHTTP(baseURL, method, path, body)
+}
+
+// callBackboneAuth is callDeed with a bearer token attached — used by
+// Deed.Pocket, whose routes are JWT-gated (unlike every other loopback-open
+// Backbone/Deed primitive).
+func callBackboneAuth(method, path, token string, body any) ([]byte, error) {
+	baseURL := os.Getenv("DEED_URL")
+	if baseURL == "" {
+		return nil, fmt.Errorf("drift: deed pocket requires a running slice (DEED_URL) — not available in local dev")
+	}
+	return callBackboneHTTPAuth(baseURL, method, path, token, body)
+}
+
+// callBackboneHTTPAuth mirrors callBackboneHTTP but attaches an
+// Authorization: Bearer header — the one Deed/Backbone call shape that
+// needs it.
+func callBackboneHTTPAuth(baseURL, method, path, token string, body any) ([]byte, error) {
+	url := baseURL + "/" + path
+
+	var bodyReader io.Reader
+	if body != nil {
+		b, err := json.Marshal(body)
+		if err != nil {
+			return nil, fmt.Errorf("drift: marshal backbone body: %w", err)
+		}
+		bodyReader = bytes.NewReader(b)
+	}
+
+	req, err := http.NewRequest(method, url, bodyReader)
+	if err != nil {
+		return nil, fmt.Errorf("drift: backbone request: %w", err)
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("drift: backbone call: %w", err)
+	}
+	defer resp.Body.Close()
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("drift: read backbone response: %w", err)
+	}
+	if resp.StatusCode >= 400 {
+		msg := strings.TrimSpace(string(data))
+		if msg == "" {
+			msg = http.StatusText(resp.StatusCode)
+		}
+		return nil, fmt.Errorf("drift: backbone %s: HTTP %d: %s", path, resp.StatusCode, msg)
+	}
+	if resp.StatusCode == http.StatusNoContent || len(data) == 0 {
+		return nil, nil
+	}
+	return data, nil
 }
 
 // --- Slice-to-slice linking ---
@@ -1261,11 +1494,13 @@ func (c Conn) WriteRaw(msg string) {
 	fmt.Fprintf(c.w, "%s\n", msg)
 }
 
-// ─── JWT primitive ───────────────────────────────────────────────────────────
+// ─── JWT primitive (Deed.JWT) ─────────────────────────────────────────────────
 //
 // HS256 JWT minting + verification, signed with the slice's per-slice JKey.
 // The signing key never leaves the slice's backbone process; all operations
-// flow through loopback HTTP to backbone /jwt/{sign,verify,slice-id}.
+// flow through loopback HTTP to /jwt/{sign,verify,slice-id}. General-purpose
+// on its own, but squarely part of Deed — KeyAuth mints its tokens through
+// it, and Pocket verifies them.
 //
 // Design: docs/memos/slice-jwt-primitive.md.
 
@@ -1338,7 +1573,7 @@ func (jwtNS) Issue(claims JWTClaims) (string, error) {
 	if len(claims.Custom) > 0 {
 		body["custom"] = claims.Custom
 	}
-	resp, err := callBackbone("POST", "jwt/sign", body)
+	resp, err := callDeed("POST", "jwt/sign", body)
 	if err != nil {
 		return "", err
 	}
@@ -1362,7 +1597,7 @@ func (jwtNS) Verify(token string, opts JWTVerifyOptions) (JWTClaims, error) {
 	if opts.AllowedIssuer != "" {
 		body["allowed_issuer"] = opts.AllowedIssuer
 	}
-	resp, err := callBackbone("POST", "jwt/verify", body)
+	resp, err := callDeed("POST", "jwt/verify", body)
 	if err != nil {
 		return JWTClaims{}, err
 	}
@@ -1419,7 +1654,7 @@ func (jwtNS) Verify(token string, opts JWTVerifyOptions) (JWTClaims, error) {
 // usually needed in app code because Verify defaults to checking that
 // `iss` matches this value automatically.
 func (jwtNS) SliceID() string {
-	resp, err := callBackbone("GET", "jwt/slice-id", nil)
+	resp, err := callDeed("GET", "jwt/slice-id", nil)
 	if err != nil {
 		return ""
 	}

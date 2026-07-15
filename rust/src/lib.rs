@@ -5,9 +5,17 @@
 //!   - `backbone` — the B of the sacred A·B·C triad; the SOLE entrypoint for
 //!     every STATE primitive: `backbone::secret`, `backbone::cache`,
 //!     `backbone::nosql`, `backbone::queue`, `backbone::blob`, `backbone::lock`,
-//!     `backbone::jwt`, `backbone::sql`, `backbone::realtime`,
-//!     `backbone::keyauth`, `backbone::vault`. (There is no top-level
+//!     `backbone::sql`, `backbone::realtime`. (There is no top-level
 //!     `drift_sdk::secret` etc. — go through `drift_sdk::backbone`.)
+//!   - `deed` — Drift's 4th architectural pillar (identity, verified), a peer
+//!     of Backbone/Atomic/Canvas: `deed::keyauth` (passwordless Ed25519
+//!     device-key auth), `deed::jwt` (general-purpose HS256 sign/verify —
+//!     KeyAuth mints its own tokens through it), `deed::vault` (an
+//!     account-key-wrapped keyring), `deed::link` (multi-device attestation /
+//!     enrollment / revocation), `deed::pocket` (E2EE per-identity app data,
+//!     JWT-gated). Not to be confused with `slice`/`caller_slice` below —
+//!     that's inter-slice networking; `deed::link` enrolls another DEVICE for
+//!     the same identity, it has nothing to do with calling another SLICE.
 //!   - log(msg): Writes to stderr (captured by runner).
 //!   - http_request(): Outbound HTTP from within a function.
 //!   - slice(name) / caller_slice(req): slice-to-slice linking.
@@ -174,6 +182,12 @@ fn get_backbone_url() -> String {
     std::env::var("BACKBONE_URL").unwrap_or_default()
 }
 
+// Deed lives on its own listener/port now — a separate env var, separate
+// base URL from Backbone's. See the `deed` module below.
+fn get_deed_url() -> String {
+    std::env::var("DEED_URL").unwrap_or_default()
+}
+
 fn percent_encode(s: &str) -> String {
     let mut out = String::new();
     for b in s.bytes() {
@@ -194,7 +208,15 @@ fn call(method: &str, path: &str, body: Option<Value>) -> Option<Value> {
     if base.is_empty() {
         return call_local(method, path, body);
     }
+    call_at(&base, method, path, body)
+}
 
+// Same wire logic as `call`, against an explicit base URL rather than
+// Backbone's. Used by `deed_call` (Deed's own listener/port) so `jwt` — the
+// one Deed primitive that keeps this softer, non-`Result` calling
+// convention — can move off Backbone's base URL without duplicating the
+// whole HTTP dance.
+fn call_at(base: &str, method: &str, path: &str, body: Option<Value>) -> Option<Value> {
     let url = format!("{}/{}", base, path);
 
     let result = if let Some(b) = body {
@@ -230,6 +252,19 @@ fn call(method: &str, path: &str, body: Option<Value>) -> Option<Value> {
         }
         Err(_) => None,
     }
+}
+
+// `jwt`'s transport: same forgiving None-on-miss convention as `call`, but
+// against Deed's own base URL (DEED_URL) since /jwt/* moved off Backbone's
+// listener along with the rest of Deed. Falls back to `call_local` in local
+// dev, same as `call` — `call_local` has no jwt/* arm, so this preserves
+// today's local-dev behavior (None) unchanged.
+fn deed_call(method: &str, path: &str, body: Option<Value>) -> Option<Value> {
+    let base = get_deed_url();
+    if base.is_empty() {
+        return call_local(method, path, body);
+    }
+    call_at(&base, method, path, body)
 }
 
 // call_raw posts raw bytes (used by blob.put). The platform's /blob/put
@@ -645,101 +680,6 @@ pub mod backbone {
     }
 
     // -----------------------------------------------------------------------
-    // JWT primitive
-    // -----------------------------------------------------------------------
-    //
-    // HS256 minting + verification, signed with the slice's per-slice JKey. The
-    // signing key never leaves the slice's backbone process; all operations flow
-    // through loopback HTTP to backbone /jwt/{sign,verify,slice-id}.
-    //
-    // Design: internal/todo/slice-jwt-primitive.md.
-
-    pub mod jwt {
-        use crate::*;
-
-        /// Returned by [`verify`] when the token fails validation. `reason`
-        /// is one of the stable wire strings: `malformed`, `bad_signature`,
-        /// `expired`, `not_yet_valid`, `wrong_algorithm`, `wrong_issuer`,
-        /// `wrong_audience`, `invalid_claims`, `missing_exp`, `internal_error`.
-        #[derive(Debug, Clone)]
-        pub struct JWTError {
-            pub reason: String,
-        }
-
-        impl std::fmt::Display for JWTError {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                write!(f, "jwt verify: {}", self.reason)
-            }
-        }
-        impl std::error::Error for JWTError {}
-
-        /// Claims payload. Matches the wire shape of the platform JWT
-        /// primitive — standard fields plus an open `custom` map.
-        #[derive(Debug, Clone, Default)]
-        pub struct Claims {
-            pub sub: Option<String>,
-            pub iat: Option<i64>,
-            pub exp: Option<i64>,
-            pub nbf: Option<i64>,
-            pub iss: Option<String>,
-            pub aud: Option<Vec<String>>,
-            pub jti: Option<String>,
-            pub custom: Option<Value>,
-        }
-
-        /// Sign a JWT with the slice's HS256 JKey. `exp` is required;
-        /// `iat`, `iss`, and `jti` are auto-set when `None`.
-        pub fn issue(claims: Claims) -> String {
-            let mut body = serde_json::Map::new();
-            if let Some(v) = claims.sub    { body.insert("sub".to_string(),    Value::String(v)); }
-            if let Some(v) = claims.iat    { body.insert("iat".to_string(),    Value::from(v)); }
-            if let Some(v) = claims.exp    { body.insert("exp".to_string(),    Value::from(v)); }
-            if let Some(v) = claims.nbf    { body.insert("nbf".to_string(),    Value::from(v)); }
-            if let Some(v) = claims.iss    { body.insert("iss".to_string(),    Value::String(v)); }
-            if let Some(v) = claims.aud    { body.insert("aud".to_string(),    serde_json::to_value(v).unwrap_or(Value::Null)); }
-            if let Some(v) = claims.jti    { body.insert("jti".to_string(),    Value::String(v)); }
-            if let Some(v) = claims.custom { body.insert("custom".to_string(), v); }
-
-            match call("POST", "jwt/sign", Some(Value::Object(body))) {
-                Some(Value::Object(m)) => {
-                    m.get("token").and_then(|v| v.as_str()).unwrap_or_default().to_string()
-                }
-                _ => String::new(),
-            }
-        }
-
-        /// Validate a token. Returns parsed claims on success; `JWTError`
-        /// on validation failure.
-        pub fn verify(token: &str, audience: Option<&str>, allowed_issuer: Option<&str>) -> Result<Value, JWTError> {
-            let mut body = serde_json::Map::new();
-            body.insert("token".to_string(), Value::String(token.to_string()));
-            if let Some(a) = audience { body.insert("audience".to_string(), Value::String(a.to_string())); }
-            if let Some(i) = allowed_issuer { body.insert("allowed_issuer".to_string(), Value::String(i.to_string())); }
-
-            let resp = match call("POST", "jwt/verify", Some(Value::Object(body))) {
-                Some(Value::Object(m)) => m,
-                _ => return Err(JWTError { reason: "internal_error".to_string() }),
-            };
-            let valid = resp.get("valid").and_then(|v| v.as_bool()).unwrap_or(false);
-            if !valid {
-                let reason = resp.get("reason").and_then(|v| v.as_str()).unwrap_or("internal_error").to_string();
-                return Err(JWTError { reason });
-            }
-            Ok(resp.get("claims").cloned().unwrap_or(Value::Null))
-        }
-
-        /// The slice's auto-set issuer string ("drift-slice-<user>-<slice>").
-        pub fn slice_id() -> String {
-            match call("GET", "jwt/slice-id", None) {
-                Some(Value::Object(m)) => {
-                    m.get("slice_id").and_then(|v| v.as_str()).unwrap_or_default().to_string()
-                }
-                _ => String::new(),
-            }
-        }
-    }
-
-    // -----------------------------------------------------------------------
     // Realtime — pub/sub fan-out over the slice's Canvas WebSocket hub.
     // -----------------------------------------------------------------------
     //
@@ -773,73 +713,6 @@ pub mod backbone {
                     _ => 0,
                 }
             }
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // KeyAuth — passwordless Ed25519 device-key auth.
-    // -----------------------------------------------------------------------
-    //
-    // uid = the public key. `challenge` mints a one-time nonce; the client signs
-    // the canonical {domain,nonce,pubkey}; `verify` checks the signature and
-    // returns THIS slice's session JWT. `domain` namespaces the signature per
-    // app (replay-safety).
-
-    pub mod keyauth {
-        use crate::*;
-
-        pub fn challenge(pubkey: &str) -> String {
-            match call("POST", "keyauth/challenge", Some(serde_json::json!({"pubkey": pubkey}))) {
-                Some(Value::Object(m)) => m.get("nonce").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-                _ => String::new(),
-            }
-        }
-
-        pub fn verify(pubkey: &str, sig: &str, domain: &str) -> String {
-            match call("POST", "keyauth/verify", Some(serde_json::json!({"pubkey": pubkey, "sig": sig, "domain": domain}))) {
-                Some(Value::Object(m)) => m.get("token").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-                _ => String::new(),
-            }
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Vault — zero-knowledge recovery store (Layer B).
-    // -----------------------------------------------------------------------
-    //
-    // User-scoped, append-only, opaque. The client encrypts the blob under a key
-    // the slice never sees. Backed by the `keyvault` NoSQL collection (declare
-    // it in your Driftfile).
-
-    pub mod vault {
-        use crate::*;
-
-        pub fn put(uid: &str, blob: &str) {
-            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
-            let nanos = now.as_ref().map(|d| d.as_nanos()).unwrap_or(0);
-            let updated_at = now.as_ref().map(|d| d.as_secs()).unwrap_or(0);
-            super::nosql::collection("keyvault").insert(serde_json::json!({
-                "_id": format!("{}:{}", uid, nanos),
-                "user_id": uid,
-                "blob": blob,
-                "updated_at": updated_at,
-            }));
-        }
-
-        pub fn get(uid: &str) -> Option<Value> {
-            let mut filter = HashMap::new();
-            filter.insert("user_id".to_string(), uid.to_string());
-            let rows = super::nosql::collection("keyvault").list(Some(filter));
-            let mut best_at: i64 = -1;
-            let mut best: Option<Value> = None;
-            for r in rows {
-                let at = r.get("updated_at").and_then(|v| v.as_i64()).unwrap_or(0);
-                if at >= best_at {
-                    best_at = at;
-                    best = r.get("blob").cloned();
-                }
-            }
-            best
         }
     }
 
@@ -949,6 +822,437 @@ pub mod backbone {
     }
 }
 
+// ===========================================================================
+// Deed — Drift's 4th architectural pillar (identity, verified), a peer of
+// Backbone/Atomic/Canvas. Five primitives: `deed::keyauth`, `deed::jwt`,
+// `deed::vault`, `deed::link`, `deed::pocket`.
+//
+// KeyAuth: passwordless Ed25519 device-key auth. JWT: general-purpose HS256
+// sign/verify (KeyAuth mints its own tokens through it). Vault: an
+// account-key-wrapped keyring. Link: multi-device attestation / enrollment /
+// revocation. Pocket: E2EE per-identity app data, JWT-gated.
+//
+// Not to be confused with slice-to-slice linking (`slice(name)` /
+// `caller_slice`, further below) — that's inter-slice networking, a
+// different, still-hypothetical future pillar. `deed::link` enrolls another
+// DEVICE for the same identity; it has nothing to do with calling another
+// SLICE.
+// ===========================================================================
+
+pub mod deed {
+    use crate::*;
+
+    /// Error returned by any Deed call: a transport failure, a non-2xx HTTP
+    /// status, or a malformed response body. Deed calls always fail loudly —
+    /// in particular, a "not found" Get (e.g. `vault::get` on a uid that
+    /// never wrote a backup, `pocket::get` on an unknown key) comes back as
+    /// `Err`, never a silent `Ok(None)`/default.
+    #[derive(Debug, Clone)]
+    pub struct DeedError {
+        pub message: String,
+    }
+
+    impl std::fmt::Display for DeedError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{}", self.message)
+        }
+    }
+    impl std::error::Error for DeedError {}
+
+    fn unavailable() -> DeedError {
+        DeedError {
+            message: "drift deed: requires a running slice (DEED_URL) — not available in local dev".to_string(),
+        }
+    }
+
+    fn malformed(path: &str) -> DeedError {
+        DeedError { message: format!("drift deed: malformed {} response", path) }
+    }
+
+    // Shared low-level transport for every Deed primitive except `jwt` (which
+    // keeps using the crate-root `deed_call()`, a softer None-on-miss
+    // convention — see its doc comment — since it's a straight relocation,
+    // not a rewrite). Unlike `call()`/`deed_call()`, this propagates transport
+    // failures and HTTP >= 400 as `Err` rather than collapsing them into
+    // `None` — the stricter convention Deed's wire contract calls for. `token`
+    // is `Some(...)` only for `pocket`, whose routes are JWT-gated; every
+    // other Deed primitive passes `None`. Deed has its own listener/port
+    // (DEED_URL), separate from Backbone's.
+    fn request(method: &str, path: &str, token: Option<&str>, body: Option<&Value>) -> Result<Value, DeedError> {
+        let base = get_deed_url();
+        if base.is_empty() {
+            return Err(unavailable());
+        }
+        let url = format!("{}/{}", base, path);
+
+        let mut req = ureq::request(method, &url);
+        if let Some(t) = token {
+            req = req.set("Authorization", &format!("Bearer {}", t));
+        }
+
+        let result = if let Some(b) = body {
+            req.set("Content-Type", "application/json")
+                .send_string(&serde_json::to_string(b).unwrap_or_default())
+        } else {
+            req.call()
+        };
+
+        match result {
+            Ok(resp) => {
+                if resp.status() == 204 {
+                    return Ok(Value::Null);
+                }
+                let text = resp.into_string().unwrap_or_default();
+                if text.is_empty() {
+                    return Ok(Value::Null);
+                }
+                serde_json::from_str(&text)
+                    .map_err(|e| DeedError { message: format!("drift deed: parse {} response: {}", path, e) })
+            }
+            Err(ureq::Error::Status(code, resp)) => {
+                let text = resp.into_string().unwrap_or_default();
+                let text = text.trim();
+                let msg = if text.is_empty() {
+                    format!("drift deed: {} HTTP {}", path, code)
+                } else {
+                    format!("drift deed: {} HTTP {}: {}", path, code, text)
+                };
+                Err(DeedError { message: msg })
+            }
+            Err(ureq::Error::Transport(t)) => {
+                Err(DeedError { message: format!("drift deed: {} request failed: {}", path, t) })
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // KeyAuth — passwordless Ed25519 device-key auth.
+    // -----------------------------------------------------------------------
+    //
+    // The client holds a keypair; the pubkey IS its identity — no accounts,
+    // no passwords, no email. `challenge` mints a one-time nonce; the client
+    // signs the canonical {domain,nonce,pubkey}; `verify` checks the
+    // signature and issues this slice's session JWT (sub = pubkey). The
+    // slice stores nothing about the user — it just verifies a signature.
+    // The client half (keygen + signing + recovery-phrase derivation) is a
+    // small browser library; see the @ondrift/keyauth memo.
+
+    pub mod keyauth {
+        use super::{request, malformed, DeedError};
+
+        /// Returns a one-time login nonce for the given Ed25519 public key
+        /// (32-byte hex). Single-use, short-TTL, cache-backed in the slice.
+        pub fn challenge(pubkey: &str) -> Result<String, DeedError> {
+            let resp = request("POST", "keyauth/challenge", None, Some(&serde_json::json!({"pubkey": pubkey})))?;
+            resp.get("nonce")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .ok_or_else(|| malformed("keyauth/challenge"))
+        }
+
+        /// Checks the client's signature over the canonical
+        /// {domain,nonce,pubkey} and, on success, returns this slice's
+        /// session JWT (sub = the pubkey). `domain` namespaces the signature
+        /// to your app (e.g. "myapp-auth-v1") so a signature for one
+        /// app/slice can't be replayed at another — the client must sign the
+        /// same domain. A bad/expired/absent challenge or a bad signature
+        /// returns `Err`.
+        pub fn verify(pubkey: &str, sig: &str, domain: &str) -> Result<String, DeedError> {
+            let resp = request(
+                "POST",
+                "keyauth/verify",
+                None,
+                Some(&serde_json::json!({"pubkey": pubkey, "sig": sig, "domain": domain})),
+            )?;
+            resp.get("token")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .ok_or_else(|| malformed("keyauth/verify"))
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // JWT primitive
+    // -----------------------------------------------------------------------
+    //
+    // HS256 minting + verification, signed with the slice's per-slice JKey. The
+    // signing key never leaves the slice's backbone process; all operations flow
+    // through loopback HTTP to backbone /jwt/{sign,verify,slice-id}.
+    //
+    // Design: internal/todo/slice-jwt-primitive.md.
+
+    pub mod jwt {
+        use crate::*;
+
+        /// Returned by [`verify`] when the token fails validation. `reason`
+        /// is one of the stable wire strings: `malformed`, `bad_signature`,
+        /// `expired`, `not_yet_valid`, `wrong_algorithm`, `wrong_issuer`,
+        /// `wrong_audience`, `invalid_claims`, `missing_exp`, `internal_error`.
+        #[derive(Debug, Clone)]
+        pub struct JWTError {
+            pub reason: String,
+        }
+
+        impl std::fmt::Display for JWTError {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "jwt verify: {}", self.reason)
+            }
+        }
+        impl std::error::Error for JWTError {}
+
+        /// Claims payload. Matches the wire shape of the platform JWT
+        /// primitive — standard fields plus an open `custom` map.
+        #[derive(Debug, Clone, Default)]
+        pub struct Claims {
+            pub sub: Option<String>,
+            pub iat: Option<i64>,
+            pub exp: Option<i64>,
+            pub nbf: Option<i64>,
+            pub iss: Option<String>,
+            pub aud: Option<Vec<String>>,
+            pub jti: Option<String>,
+            pub custom: Option<Value>,
+        }
+
+        /// Sign a JWT with the slice's HS256 JKey. `exp` is required;
+        /// `iat`, `iss`, and `jti` are auto-set when `None`.
+        pub fn issue(claims: Claims) -> String {
+            let mut body = serde_json::Map::new();
+            if let Some(v) = claims.sub    { body.insert("sub".to_string(),    Value::String(v)); }
+            if let Some(v) = claims.iat    { body.insert("iat".to_string(),    Value::from(v)); }
+            if let Some(v) = claims.exp    { body.insert("exp".to_string(),    Value::from(v)); }
+            if let Some(v) = claims.nbf    { body.insert("nbf".to_string(),    Value::from(v)); }
+            if let Some(v) = claims.iss    { body.insert("iss".to_string(),    Value::String(v)); }
+            if let Some(v) = claims.aud    { body.insert("aud".to_string(),    serde_json::to_value(v).unwrap_or(Value::Null)); }
+            if let Some(v) = claims.jti    { body.insert("jti".to_string(),    Value::String(v)); }
+            if let Some(v) = claims.custom { body.insert("custom".to_string(), v); }
+
+            match deed_call("POST", "jwt/sign", Some(Value::Object(body))) {
+                Some(Value::Object(m)) => {
+                    m.get("token").and_then(|v| v.as_str()).unwrap_or_default().to_string()
+                }
+                _ => String::new(),
+            }
+        }
+
+        /// Validate a token. Returns parsed claims on success; `JWTError`
+        /// on validation failure.
+        pub fn verify(token: &str, audience: Option<&str>, allowed_issuer: Option<&str>) -> Result<Value, JWTError> {
+            let mut body = serde_json::Map::new();
+            body.insert("token".to_string(), Value::String(token.to_string()));
+            if let Some(a) = audience { body.insert("audience".to_string(), Value::String(a.to_string())); }
+            if let Some(i) = allowed_issuer { body.insert("allowed_issuer".to_string(), Value::String(i.to_string())); }
+
+            let resp = match deed_call("POST", "jwt/verify", Some(Value::Object(body))) {
+                Some(Value::Object(m)) => m,
+                _ => return Err(JWTError { reason: "internal_error".to_string() }),
+            };
+            let valid = resp.get("valid").and_then(|v| v.as_bool()).unwrap_or(false);
+            if !valid {
+                let reason = resp.get("reason").and_then(|v| v.as_str()).unwrap_or("internal_error").to_string();
+                return Err(JWTError { reason });
+            }
+            Ok(resp.get("claims").cloned().unwrap_or(Value::Null))
+        }
+
+        /// The slice's auto-set issuer string ("drift-slice-<user>-<slice>").
+        pub fn slice_id() -> String {
+            match deed_call("GET", "jwt/slice-id", None) {
+                Some(Value::Object(m)) => {
+                    m.get("slice_id").and_then(|v| v.as_str()).unwrap_or_default().to_string()
+                }
+                _ => String::new(),
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Vault — zero-knowledge recovery store.
+    // -----------------------------------------------------------------------
+    //
+    // Opaque, user-scoped, append-only. The client encrypts the blob under a
+    // key derived from its recovery phrase (which the slice NEVER sees), so
+    // Drift stores the backup but cannot read it. Scoped to a uid the caller
+    // supplies — typically the authenticated KeyAuth pubkey. Backed by
+    // Deed's own dedicated routes: AES-256-GCM at rest (defense in depth
+    // only — the blob must already be ciphertext before it arrives, since
+    // that's the actual source of Vault's confidentiality guarantee) and a
+    // per-item size quota. No Driftfile declaration needed.
+
+    pub mod vault {
+        use crate::*;
+        use super::{request, malformed, DeedError};
+
+        /// Appends an opaque encrypted backup blob for uid. Append-only (a
+        /// new version each call); `get` returns the newest.
+        pub fn put(uid: &str, blob: Value) -> Result<(), DeedError> {
+            request("POST", "deed/vault/put", None, Some(&serde_json::json!({"uid": uid, "blob": blob})))?;
+            Ok(())
+        }
+
+        /// Returns the most recent backup blob for uid. Returns `Err` if uid
+        /// has never written one (same "not found is an error" convention as
+        /// `backbone::secret::get`/`backbone::blob::get`).
+        pub fn get(uid: &str) -> Result<Value, DeedError> {
+            let resp = request("GET", &format!("deed/vault/get?uid={}", percent_encode(uid)), None, None)?;
+            resp.get("blob").cloned().ok_or_else(|| malformed("deed/vault/get"))
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Link — multi-device continuity.
+    // -----------------------------------------------------------------------
+    //
+    // Generalizes the enroll/attest/revoke pattern so an identity's KeyAuth
+    // session can move to a second, third, ... device. The signature
+    // parameters below (sig, attesting_pubkey, etc.) are produced entirely
+    // client-side — this SDK only forwards them, the same way
+    // `keyauth::verify` forwards a signature it never computes itself. The
+    // one rule the whole design rests on: Deed verifies, it never decides —
+    // a device is only ever added on the strength of a signature from a
+    // device already active in the identity's registry.
+    //
+    // Not to be confused with slice-to-slice linking (`slice(name)` /
+    // `caller_slice`, at the crate root) — this Link enrolls a DEVICE for
+    // one identity, it does not call another slice.
+
+    pub mod link {
+        use super::{request, malformed, DeedError};
+
+        /// Returned by [`complete`]. `identity` is set only once
+        /// `status == "attested"`.
+        #[derive(Debug, Clone, Default)]
+        pub struct LinkStatus {
+            pub status: String,
+            pub identity: Option<String>,
+        }
+
+        /// Starts a device-linking session for a not-yet-enrolled device's
+        /// pubkey (usually carried in a QR code alongside the pubkey).
+        /// Returns a session ID for an already-active device to present to
+        /// `attest`.
+        pub fn begin(pubkey: &str) -> Result<String, DeedError> {
+            let resp = request("POST", "deed/link/begin", None, Some(&serde_json::json!({"pubkey": pubkey})))?;
+            resp.get("session_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .ok_or_else(|| malformed("deed/link/begin"))
+        }
+
+        /// Has an already-active device vouch for the session's pending
+        /// device. `sig` is the client's signature over the canonical
+        /// {domain,identity,new_pubkey} message — computed client-side,
+        /// never by this SDK.
+        pub fn attest(identity: &str, session_id: &str, attesting_pubkey: &str, sig: &str) -> Result<(), DeedError> {
+            request(
+                "POST",
+                "deed/link/attest",
+                None,
+                Some(&serde_json::json!({
+                    "identity": identity,
+                    "session_id": session_id,
+                    "attesting_pubkey": attesting_pubkey,
+                    "sig": sig,
+                })),
+            )?;
+            Ok(())
+        }
+
+        /// Polls a session the new device started with `begin`, returning
+        /// whether an active device has attested it yet.
+        pub fn complete(session_id: &str) -> Result<LinkStatus, DeedError> {
+            let resp = request("POST", "deed/link/complete", None, Some(&serde_json::json!({"session_id": session_id})))?;
+            Ok(LinkStatus {
+                status: resp.get("status").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                identity: resp.get("identity").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            })
+        }
+
+        /// Deactivates target_pubkey in identity's device registry. Any
+        /// currently-active device may revoke another (or itself);
+        /// revoking_pubkey is the device doing the revoking, sig its
+        /// signature over the canonical {domain,identity,target_pubkey}
+        /// message.
+        pub fn revoke(identity: &str, target_pubkey: &str, revoking_pubkey: &str, sig: &str) -> Result<(), DeedError> {
+            request(
+                "POST",
+                "deed/link/revoke",
+                None,
+                Some(&serde_json::json!({
+                    "identity": identity,
+                    "target_pubkey": target_pubkey,
+                    "revoking_pubkey": revoking_pubkey,
+                    "sig": sig,
+                })),
+            )?;
+            Ok(())
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Pocket — E2EE per-identity app data.
+    // -----------------------------------------------------------------------
+    //
+    // An app's actual data — E2EE, content-keyed, following an identity
+    // across every device Link has enrolled. The crypto work happens
+    // entirely client-side before anything reaches this primitive; Pocket
+    // never encrypts or decrypts the payload itself. Every call takes
+    // `token` explicitly (the JWT `keyauth::verify` returned) rather than
+    // holding hidden session state — matching the rest of this SDK's
+    // stateless posture inside an Atomic function invocation. The token's
+    // sub is the only identity a call can read or write under; there is no
+    // way to name a different one. Every call sends it as an
+    // `Authorization: Bearer <token>` header.
+
+    pub mod pocket {
+        use crate::*;
+        use super::{request, malformed, DeedError};
+
+        /// Stores blob under key for whichever identity token resolves to.
+        pub fn set(token: &str, key: &str, blob: Value) -> Result<(), DeedError> {
+            request(
+                "POST",
+                "deed/pocket/set",
+                Some(token),
+                Some(&serde_json::json!({"key": key, "blob": blob})),
+            )?;
+            Ok(())
+        }
+
+        /// Returns the blob stored under key for token's identity. Returns
+        /// `Err` if no such key exists.
+        pub fn get(token: &str, key: &str) -> Result<Value, DeedError> {
+            let resp = request(
+                "GET",
+                &format!("deed/pocket/get?key={}", percent_encode(key)),
+                Some(token),
+                None,
+            )?;
+            resp.get("blob").cloned().ok_or_else(|| malformed("deed/pocket/get"))
+        }
+
+        /// Removes key for token's identity. Returns `Err` if no such key
+        /// exists.
+        pub fn delete(token: &str, key: &str) -> Result<(), DeedError> {
+            request("POST", "deed/pocket/delete", Some(token), Some(&serde_json::json!({"key": key})))?;
+            Ok(())
+        }
+
+        /// Returns every key stored under token's identity — never another
+        /// identity's, even by guessing.
+        pub fn list(token: &str) -> Result<Vec<String>, DeedError> {
+            let resp = request("GET", "deed/pocket/list", Some(token), None)?;
+            match resp {
+                Value::Array(arr) => Ok(arr
+                    .into_iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()),
+                _ => Err(malformed("deed/pocket/list")),
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Logging
 // ---------------------------------------------------------------------------
@@ -1031,7 +1335,7 @@ pub fn http_request_with_timeout(
 
 /// Entry point for SSE streaming functions.
 ///
-/// ```rust
+/// ```rust,no_run
 /// // @atomic http=get:events auth=none stream=sse
 /// drift_sdk::run_sse(|req, emit| {
 ///     for i in 0..10 {
@@ -1223,7 +1527,7 @@ impl WsConn {
 
 /// Entry point for WebSocket functions.
 ///
-/// ```rust
+/// ```rust,no_run
 /// // @atomic http=get:chat auth=none stream=ws
 /// drift_sdk::run_ws(|req, conn| {
 ///     loop {

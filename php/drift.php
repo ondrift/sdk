@@ -5,12 +5,17 @@
  * This single-file SDK provides:
  *   - \Drift\run($handler): Entry point that dispatches to deployed or local mode.
  *   - \Drift\Backbone\* — the B of the sacred A·B·C triad; the SOLE entrypoint
- *     for every STATE primitive: Secret, Cache, Nosql, queue, Blob, Lock, JWT,
- *     sql, Realtime, KeyAuth, Vault. (There is no \Drift\Secret etc. — go
- *     through the \Drift\Backbone namespace.)
+ *     for every STATE primitive: Secret, Cache, Nosql, queue, Blob, Lock,
+ *     sql, Realtime. (There is no \Drift\Secret etc. — go through the
+ *     \Drift\Backbone namespace.)
+ *   - \Drift\Deed\* — the 4th pillar, identity, verified: KeyAuth, JWT,
+ *     Vault, Link, Pocket. A peer of \Drift\Backbone, not one of its
+ *     primitives.
  *   - \Drift\log($msg): Writes to stderr (captured by the runner as function logs).
  *   - \Drift\http_request(): Outbound HTTP from within a function.
- *   - \Drift\slice($name) / \Drift\caller_slice($req): slice-to-slice linking.
+ *   - \Drift\slice($name) / \Drift\caller_slice($req): slice-to-slice linking
+ *     (unrelated to \Drift\Deed\Link, which enrolls a DEVICE for one
+ *     identity — not the same thing as calling another SLICE).
  *
  * All backbone helpers use only PHP built-ins -- zero external dependencies.
  */
@@ -115,19 +120,46 @@ function _get_backbone_url(): string {
     return $_backbone_url;
 }
 
-// _backbone_http issues a request to the backbone over TCP
-// (BACKBONE_URL=http://host:port). Returns [status_code, body]. Stdlib only —
-// the http stream wrapper.
-function _backbone_http(string $method, string $path, ?string $body, string $content_type): array {
-    $base = _get_backbone_url();
+$_deed_url = null;
+
+// Deed has its own listener/port now (DEED_URL), separate from Backbone's
+// — see _call_deed below.
+function _get_deed_url(): string {
+    global $_deed_url;
+    if ($_deed_url === null) {
+        $_deed_url = getenv('DEED_URL') ?: '';
+    }
+    return $_deed_url;
+}
+
+// _backbone_http issues a request over TCP (file_get_contents opens a fresh
+// connection per call, so no persistent-connection thrashing concern
+// between different hosts/ports). Returns [status_code, body]. Stdlib only —
+// the http stream wrapper. $extra_headers is a one-off escape hatch for
+// Drift\Deed\Pocket, the one call shape in this file that needs a bearer
+// token attached (every other Backbone/Deed primitive is loopback-open); it
+// defaults to [] so every existing call site is unaffected. $base defaults
+// to Backbone's URL; _call_deed passes Deed's own URL instead, since Deed
+// lives on a separate port.
+function _backbone_http(string $method, string $path, ?string $body, string $content_type, array $extra_headers = [], ?string $base = null): array {
+    $base = $base ?? _get_backbone_url();
     // TLS verification is explicit even though Backbone is loopback in
     // production — keeps the policy uniform with http_request().
     $opts = [
         'http' => ['method' => $method, 'ignore_errors' => true],
         'ssl'  => ['verify_peer' => true, 'verify_peer_name' => true],
     ];
+    $header_str = '';
     if ($body !== null) {
-        $opts['http']['header'] = "Content-Type: $content_type\r\n";
+        $header_str .= "Content-Type: $content_type\r\n";
+    }
+    foreach ($extra_headers as $name => $value) {
+        $header_str .= "$name: $value\r\n";
+    }
+    if ($header_str !== '') {
+        $opts['http']['header'] = $header_str;
+    }
+    if ($body !== null) {
         $opts['http']['content'] = $body;
     }
     $result = @file_get_contents("$base/$path", false, stream_context_create($opts));
@@ -261,11 +293,12 @@ function _call_local(string $method, string $path, $body = null) {
 // ---------------------------------------------------------------------------
 
 /**
- * Thrown by Drift\Backbone\JWT::verify on validation failure. ``reason`` is one
+ * Thrown by Drift\Deed\JWT::verify on validation failure. ``reason`` is one
  * of the stable wire strings: malformed, bad_signature, expired,
  * not_yet_valid, wrong_algorithm, wrong_issuer, wrong_audience,
  * invalid_claims, missing_exp, internal_error. Kept at the top level (it is an
- * error type, not a state entrypoint).
+ * error type, not a state entrypoint — same reasoning that keeps it out of
+ * \Drift\Deed too, even though JWT itself moved there).
  */
 class JWTError extends \Exception {
     public string $reason;
@@ -525,6 +558,10 @@ function env(string $key): string {
 // state primitive. Reach these as \Drift\Backbone\Secret::get(...),
 // \Drift\Backbone\queue(...), \Drift\Backbone\Realtime::channel(...), etc.
 // Nothing stateful lives in the top-level \Drift namespace.
+//
+// Identity — KeyAuth, JWT, Vault, Link, Pocket — lives under \Drift\Deed,
+// a peer of Backbone rather than one of its primitives; see the
+// \Drift\Deed namespace at the end of this file.
 // ===========================================================================
 
 namespace Drift\Backbone {
@@ -707,60 +744,6 @@ class Lock {
 }
 
 // ---------------------------------------------------------------------------
-// JWT primitive
-// ---------------------------------------------------------------------------
-//
-// HS256 minting + verification, signed with the slice's per-slice JKey. The
-// signing key never leaves the slice's backbone process; all operations flow
-// through loopback HTTP to backbone /jwt/{sign,verify,slice-id}.
-//
-// Design: internal/todo/slice-jwt-primitive.md.
-
-class JWT {
-    /**
-     * Sign a JWT with the slice's HS256 JKey. ``exp`` is required;
-     * ``iat``, ``iss``, and ``jti`` are auto-set when null. ``custom``
-     * is an associative array of app-specific claims that the platform
-     * never inspects.
-     */
-    public static function issue(array $claims = []): string {
-        $allowed = ['sub', 'iat', 'exp', 'nbf', 'iss', 'aud', 'jti', 'custom'];
-        $body = [];
-        foreach ($allowed as $k) {
-            if (array_key_exists($k, $claims) && $claims[$k] !== null) {
-                $body[$k] = $claims[$k];
-            }
-        }
-        $resp = _call('POST', 'jwt/sign', $body);
-        return is_array($resp) ? (string)($resp['token'] ?? '') : '';
-    }
-
-    /**
-     * Validate a token. Returns the parsed claims array on success;
-     * throws Drift\JWTError on validation failure.
-     */
-    public static function verify(string $token, ?string $audience = null, ?string $allowed_issuer = null): array {
-        $body = ['token' => $token];
-        if ($audience !== null)       $body['audience']       = $audience;
-        if ($allowed_issuer !== null) $body['allowed_issuer'] = $allowed_issuer;
-        $resp = _call('POST', 'jwt/verify', $body);
-        if (!is_array($resp)) {
-            throw new \Drift\JWTError('internal_error');
-        }
-        if (empty($resp['valid'])) {
-            throw new \Drift\JWTError($resp['reason'] ?? 'internal_error');
-        }
-        return $resp['claims'] ?? [];
-    }
-
-    /** The slice's auto-set issuer string ("drift-slice-<user>-<slice>"). */
-    public static function slice_id(): string {
-        $resp = _call('GET', 'jwt/slice-id');
-        return is_array($resp) ? (string)($resp['slice_id'] ?? '') : '';
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Realtime — pub/sub fan-out over the slice's Canvas WebSocket hub.
 // ---------------------------------------------------------------------------
 //
@@ -788,62 +771,6 @@ class RealtimeChannel {
     public function presence(): int {
         $resp = _call('GET', 'realtime/presence?channel=' . urlencode($this->name));
         return is_array($resp) ? (int)($resp['present'] ?? 0) : 0;
-    }
-}
-
-// ---------------------------------------------------------------------------
-// KeyAuth — passwordless Ed25519 device-key auth.
-// ---------------------------------------------------------------------------
-//
-// uid = the public key. ``challenge`` mints a one-time nonce; the client signs
-// the canonical {domain,nonce,pubkey}; ``verify`` checks the signature and
-// returns THIS slice's session JWT. ``domain`` namespaces the signature per
-// app (replay-safety).
-
-class KeyAuth {
-    public static function challenge(string $pubkey): string {
-        $resp = _call('POST', 'keyauth/challenge', ['pubkey' => $pubkey]);
-        return is_array($resp) ? (string)($resp['nonce'] ?? '') : '';
-    }
-
-    public static function verify(string $pubkey, string $sig, string $domain): string {
-        $resp = _call('POST', 'keyauth/verify', ['pubkey' => $pubkey, 'sig' => $sig, 'domain' => $domain]);
-        return is_array($resp) ? (string)($resp['token'] ?? '') : '';
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Vault — zero-knowledge recovery store (Layer B).
-// ---------------------------------------------------------------------------
-//
-// User-scoped, append-only, opaque. The client encrypts the blob under a key
-// the slice never sees. Backed by the `keyvault` NoSQL collection (declare it
-// in your Driftfile).
-
-class Vault {
-    public static function put(string $uid, string $blob): void {
-        $nanos = hrtime(true);
-        Nosql::collection('keyvault')->insert([
-            '_id'        => "$uid:$nanos",
-            'user_id'    => $uid,
-            'blob'       => $blob,
-            'updated_at' => time(),
-        ]);
-    }
-
-    public static function get(string $uid) {
-        $rows = Nosql::collection('keyvault')->list(['user_id' => $uid]);
-        $best_at = -1;
-        $best = null;
-        foreach ($rows as $r) {
-            if (!is_array($r)) continue;
-            $at = $r['updated_at'] ?? 0;
-            if ($at >= $best_at) {
-                $best_at = $at;
-                $best = $r['blob'] ?? null;
-            }
-        }
-        return $best;
     }
 }
 
@@ -951,3 +878,292 @@ function sql(string $name): SqlDb {
 }
 
 } // namespace Drift\Backbone
+
+// ===========================================================================
+// Deed — the 4th pillar: identity, verified. A peer of \Drift\Backbone (not
+// one of its primitives), reached as \Drift\Deed\KeyAuth, \Drift\Deed\JWT,
+// \Drift\Deed\Vault, \Drift\Deed\Link, \Drift\Deed\Pocket.
+//
+// KeyAuth: passwordless Ed25519 device-key auth. JWT: general-purpose HS256
+// sign/verify (KeyAuth mints its own tokens through it). Vault: an
+// account-key-wrapped keyring. Link: multi-device attestation / enrollment /
+// revocation. Pocket: E2EE per-identity app data, JWT-gated.
+//
+// Not to be confused with cross-slice calling (\Drift\slice($name) /
+// \Drift\caller_slice($req), defined above in the top-level \Drift
+// namespace) — that's inter-slice networking, a different, still-
+// hypothetical future pillar. Deed\Link enrolls another DEVICE for the same
+// identity; it has nothing to do with calling another SLICE.
+// ===========================================================================
+
+namespace Drift\Deed {
+
+use function Drift\_backbone_http;
+use function Drift\_get_deed_url;
+
+// ---------------------------------------------------------------------------
+// KeyAuth — passwordless Ed25519 device-key auth.
+// ---------------------------------------------------------------------------
+//
+// uid = the public key. ``challenge`` mints a one-time nonce; the client signs
+// the canonical {domain,nonce,pubkey}; ``verify`` checks the signature and
+// returns THIS slice's session JWT. ``domain`` namespaces the signature per
+// app (replay-safety). Moved here verbatim from \Drift\Backbone\KeyAuth —
+// routes are unchanged, only the namespace moved.
+
+class KeyAuth {
+    public static function challenge(string $pubkey): string {
+        $resp = _call_deed('POST', 'keyauth/challenge', ['pubkey' => $pubkey]);
+        return is_array($resp) ? (string)($resp['nonce'] ?? '') : '';
+    }
+
+    public static function verify(string $pubkey, string $sig, string $domain): string {
+        $resp = _call_deed('POST', 'keyauth/verify', ['pubkey' => $pubkey, 'sig' => $sig, 'domain' => $domain]);
+        return is_array($resp) ? (string)($resp['token'] ?? '') : '';
+    }
+}
+
+// ---------------------------------------------------------------------------
+// JWT primitive
+// ---------------------------------------------------------------------------
+//
+// HS256 minting + verification, signed with the slice's per-slice JKey. The
+// signing key never leaves the slice's backbone process; all operations flow
+// through loopback HTTP to backbone /jwt/{sign,verify,slice-id}. Moved here
+// verbatim from \Drift\Backbone\JWT — routes and method surface are
+// unchanged, only the namespace moved.
+//
+// Design: internal/todo/slice-jwt-primitive.md.
+
+class JWT {
+    /**
+     * Sign a JWT with the slice's HS256 JKey. ``exp`` is required;
+     * ``iat``, ``iss``, and ``jti`` are auto-set when null. ``custom``
+     * is an associative array of app-specific claims that the platform
+     * never inspects.
+     */
+    public static function issue(array $claims = []): string {
+        $allowed = ['sub', 'iat', 'exp', 'nbf', 'iss', 'aud', 'jti', 'custom'];
+        $body = [];
+        foreach ($allowed as $k) {
+            if (array_key_exists($k, $claims) && $claims[$k] !== null) {
+                $body[$k] = $claims[$k];
+            }
+        }
+        $resp = _call_deed('POST', 'jwt/sign', $body);
+        return is_array($resp) ? (string)($resp['token'] ?? '') : '';
+    }
+
+    /**
+     * Validate a token. Returns the parsed claims array on success;
+     * throws Drift\JWTError on validation failure.
+     */
+    public static function verify(string $token, ?string $audience = null, ?string $allowed_issuer = null): array {
+        $body = ['token' => $token];
+        if ($audience !== null)       $body['audience']       = $audience;
+        if ($allowed_issuer !== null) $body['allowed_issuer'] = $allowed_issuer;
+        $resp = _call_deed('POST', 'jwt/verify', $body);
+        if (!is_array($resp)) {
+            throw new \Drift\JWTError('internal_error');
+        }
+        if (empty($resp['valid'])) {
+            throw new \Drift\JWTError($resp['reason'] ?? 'internal_error');
+        }
+        return $resp['claims'] ?? [];
+    }
+
+    /** The slice's auto-set issuer string ("drift-slice-<user>-<slice>"). */
+    public static function slice_id(): string {
+        $resp = _call_deed('GET', 'jwt/slice-id');
+        return is_array($resp) ? (string)($resp['slice_id'] ?? '') : '';
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Vault — zero-knowledge recovery store.
+// ---------------------------------------------------------------------------
+//
+// Opaque, user-scoped, append-only. The client encrypts the blob under a key
+// derived from its recovery phrase (which the slice NEVER sees), so Drift
+// stores the backup but cannot read it. Backed by Deed's own dedicated
+// routes (deed/vault/put, deed/vault/get): AES-256-GCM at rest is defense
+// in depth only — the blob must already be ciphertext before it arrives,
+// since that's the actual source of Vault's confidentiality guarantee. No
+// Driftfile declaration needed — this REWRITES and replaces the old
+// generic-NoSQL-collection (`keyvault`) implementation entirely.
+
+class Vault {
+    /**
+     * Append an opaque encrypted backup blob for uid. Append-only (a new
+     * version each call); get() returns the newest.
+     */
+    public static function put(string $uid, $blob): void {
+        _call_deed('POST', 'deed/vault/put', ['uid' => $uid, 'blob' => $blob]);
+    }
+
+    /**
+     * Return the most recent backup blob for uid. Throws \RuntimeException
+     * if uid has never written one (same "not found is an error"
+     * convention as Deed\Pocket::get() below).
+     */
+    public static function get(string $uid) {
+        $resp = _call_deed('GET', 'deed/vault/get?uid=' . urlencode($uid));
+        return is_array($resp) ? ($resp['blob'] ?? null) : null;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Link — multi-device attestation / enrollment / revocation.
+// ---------------------------------------------------------------------------
+//
+// Generalizes the enroll/attest/revoke pattern so an identity's KeyAuth
+// session can move to a second, third, ... device. The signature
+// parameters below ($sig, $attesting_pubkey, etc.) are produced entirely
+// client-side — this SDK only forwards them, the same way KeyAuth::verify()
+// forwards a signature it never computes itself. The one rule the whole
+// design rests on: Deed verifies, it never decides — a device is only ever
+// added on the strength of a signature from a device already active in the
+// identity's registry.
+//
+// Not to be confused with cross-slice calling (\Drift\slice($name) /
+// \Drift\caller_slice($req)) — this Link enrolls a DEVICE for one identity,
+// it does not call another slice.
+
+class Link {
+    /**
+     * Start a device-linking session for a not-yet-enrolled device's
+     * pubkey (usually carried in a QR code alongside the pubkey). Returns
+     * a session ID for an already-active device to present to attest().
+     */
+    public static function begin(string $pubkey): string {
+        $resp = _call_deed('POST', 'deed/link/begin', ['pubkey' => $pubkey]);
+        return is_array($resp) ? (string)($resp['session_id'] ?? '') : '';
+    }
+
+    /**
+     * Have an already-active device vouch for the session's pending
+     * device. $sig is the client's signature over the canonical
+     * {domain,identity,new_pubkey} message — computed client-side, never
+     * by this SDK.
+     */
+    public static function attest(string $identity, string $session_id, string $attesting_pubkey, string $sig): void {
+        _call_deed('POST', 'deed/link/attest', [
+            'identity'         => $identity,
+            'session_id'       => $session_id,
+            'attesting_pubkey' => $attesting_pubkey,
+            'sig'              => $sig,
+        ]);
+    }
+
+    /**
+     * Poll a session the new device started with begin(), returning
+     * whether an active device has attested it yet. Result:
+     * ['status' => ..., 'identity' => ...] — identity is set only once
+     * status === 'attested'.
+     */
+    public static function complete(string $session_id): array {
+        $resp = _call_deed('POST', 'deed/link/complete', ['session_id' => $session_id]);
+        return is_array($resp) ? $resp : ['status' => '', 'identity' => ''];
+    }
+
+    /**
+     * Deactivate target_pubkey in identity's device registry. Any
+     * currently-active device may revoke another (or itself);
+     * $revoking_pubkey is the device doing the revoking, $sig its
+     * signature over the canonical {domain,identity,target_pubkey}
+     * message.
+     */
+    public static function revoke(string $identity, string $target_pubkey, string $revoking_pubkey, string $sig): void {
+        _call_deed('POST', 'deed/link/revoke', [
+            'identity'        => $identity,
+            'target_pubkey'   => $target_pubkey,
+            'revoking_pubkey' => $revoking_pubkey,
+            'sig'             => $sig,
+        ]);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pocket — E2EE per-identity app data, JWT-gated.
+// ---------------------------------------------------------------------------
+//
+// An app's actual data — E2EE, content-keyed, following an identity across
+// every device Link has enrolled. The crypto work happens entirely
+// client-side before anything reaches this primitive; Pocket never
+// encrypts or decrypts the payload itself. Every call takes $token
+// explicitly (the JWT KeyAuth::verify() returned) rather than holding
+// hidden session state — matching the rest of this SDK's stateless posture
+// inside an Atomic function invocation. The token's sub is the only
+// identity a call can read or write under; there is no way to name a
+// different one. Every call sends "Authorization: Bearer <token>".
+
+class Pocket {
+    /** Store $blob under $key for whichever identity $token resolves to. */
+    public static function set(string $token, string $key, $blob): void {
+        _call_deed('POST', 'deed/pocket/set', ['key' => $key, 'blob' => $blob], $token);
+    }
+
+    /**
+     * Return the blob stored under $key for $token's identity. Throws
+     * \RuntimeException if no such key exists.
+     */
+    public static function get(string $token, string $key) {
+        $resp = _call_deed('GET', 'deed/pocket/get?key=' . urlencode($key), null, $token);
+        return is_array($resp) ? ($resp['blob'] ?? null) : null;
+    }
+
+    /**
+     * Remove $key for $token's identity. Throws \RuntimeException if no
+     * such key exists.
+     */
+    public static function delete(string $token, string $key): void {
+        _call_deed('POST', 'deed/pocket/delete', ['key' => $key], $token);
+    }
+
+    /**
+     * Every key stored under $token's identity — never another identity's,
+     * even by guessing.
+     *
+     * Named list_keys(), not list(): PHP 7+ technically permits `list` as
+     * a method name (verified with `php -l`/`php` directly), but this file
+     * avoids it anyway for clarity at the call site, following the same
+     * snake_case naming already used elsewhere here (slice_id(),
+     * caller_slice()).
+     */
+    public static function list_keys(string $token): array {
+        $resp = _call_deed('GET', 'deed/pocket/list', null, $token);
+        return is_array($resp) ? $resp : [];
+    }
+}
+
+// _call_deed is \Drift\_call with a status check and, optionally, a bearer
+// token attached — used by Deed's own dedicated routes (Vault, Link,
+// Pocket), which need a hard "not found is an error" convention (unlike the
+// older generic Backbone primitives such as Secret::get()/Blob::get(),
+// which return an empty/null value for a missing item) and, for Pocket, an
+// Authorization header (unlike every other loopback-open Backbone/Deed
+// primitive). Requires a running slice (DEED_URL) — same as KeyAuth/JWT
+// above, there is no local-dev in-memory fallback for Deed's own dedicated
+// routes.
+function _call_deed(string $method, string $path, $body = null, ?string $token = null) {
+    $base = _get_deed_url();
+    if ($base === '') {
+        throw new \RuntimeException(
+            'drift: deed requires a running slice (DEED_URL) — not available in local dev'
+        );
+    }
+    $headers = $token !== null ? ['Authorization' => "Bearer $token"] : [];
+    [$status, $result] = _backbone_http(
+        $method, $path, $body !== null ? json_encode($body) : null, 'application/json', $headers, $base
+    );
+    if ($status >= 400) {
+        $msg = trim((string)$result);
+        if ($msg === '') $msg = "HTTP $status";
+        throw new \RuntimeException("drift: backbone $path: HTTP $status: $msg");
+    }
+    if ($status === 204 || $result === null || $result === '') return null;
+    $decoded = json_decode($result, true);
+    return ($decoded !== null) ? $decoded : $result;
+}
+
+} // namespace Drift\Deed

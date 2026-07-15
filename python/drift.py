@@ -128,6 +128,16 @@ def _get_backbone_url():
     return _backbone_url
 
 
+_deed_url = None
+
+
+def _get_deed_url():
+    global _deed_url
+    if _deed_url is None:
+        _deed_url = os.environ.get("DEED_URL", "")
+    return _deed_url
+
+
 # Persistent HTTP connection to the backbone.
 #
 # Why this exists: the previous implementation opened a fresh TCP
@@ -168,6 +178,35 @@ def _ensure_conn(base_url):
         _conn = http.client.HTTPConnection(host, port, timeout=30)
         _conn_target = target
     return _conn, parsed.path or ""
+
+
+# Deed gets its own persistent connection, separate from Backbone's — it
+# lives on its own port (DEED_URL) now, and sharing one connection between
+# the two would thrash _ensure_conn's target check on every call that
+# alternates between them (e.g. a handler that reads a Secret then calls
+# Deed.Vault.Get).
+_deed_conn = None
+_deed_conn_target = None
+_deed_conn_lock = threading.Lock()
+
+
+def _ensure_deed_conn(base_url):
+    """Create or reuse a persistent Deed connection — same pattern as
+    _ensure_conn, kept separate since Deed and Backbone are different ports."""
+    global _deed_conn, _deed_conn_target
+    parsed = urllib.parse.urlparse(base_url)
+    host = parsed.hostname or "localhost"
+    port = parsed.port or 80
+    target = (host, port)
+    if _deed_conn is None or _deed_conn_target != target:
+        if _deed_conn is not None:
+            try:
+                _deed_conn.close()
+            except Exception:
+                pass
+        _deed_conn = http.client.HTTPConnection(host, port, timeout=30)
+        _deed_conn_target = target
+    return _deed_conn, parsed.path or ""
 
 
 def _call(method, path, body=None):
@@ -651,95 +690,6 @@ class WsConn:
         sys.stdout.flush()
 
 
-# ---------------------------------------------------------------------------
-# JWT primitive
-# ---------------------------------------------------------------------------
-#
-# HS256 minting + verification, signed with the slice's per-slice JKey. The
-# signing key never leaves the slice's backbone process; all operations flow
-# through loopback HTTP to backbone /jwt/{sign,verify,slice-id}.
-#
-# Design: internal/todo/slice-jwt-primitive.md.
-
-
-class JWTError(Exception):
-    """Raised by jwt.verify on validation failure. ``reason`` is one of the
-    stable wire strings: ``malformed``, ``bad_signature``, ``expired``,
-    ``not_yet_valid``, ``wrong_algorithm``, ``wrong_issuer``,
-    ``wrong_audience``, ``invalid_claims``, ``missing_exp``,
-    ``internal_error``.
-    """
-
-    def __init__(self, reason):
-        super().__init__(f"jwt verify: {reason}")
-        self.reason = reason
-
-
-class _JWTNS:
-    def issue(
-        self,
-        sub=None,
-        exp=None,
-        iat=None,
-        nbf=None,
-        iss=None,
-        aud=None,
-        jti=None,
-        custom=None,
-    ):
-        """Sign a JWT with the slice's HS256 JKey.
-
-        ``exp`` is required. ``iat``, ``iss``, and ``jti`` are auto-set when
-        unset. ``custom`` is a dict of app-specific claims that the platform
-        never inspects.
-        """
-        body = {}
-        if sub is not None:
-            body["sub"] = sub
-        if exp is not None:
-            body["exp"] = exp
-        if iat is not None:
-            body["iat"] = iat
-        if nbf is not None:
-            body["nbf"] = nbf
-        if iss is not None:
-            body["iss"] = iss
-        if aud is not None:
-            body["aud"] = aud
-        if jti is not None:
-            body["jti"] = jti
-        if custom is not None:
-            body["custom"] = custom
-        resp = _call("POST", "jwt/sign", body)
-        return resp.get("token") if isinstance(resp, dict) else None
-
-    def verify(self, token, audience=None, allowed_issuer=None):
-        """Validate ``token``. Returns the parsed claims dict on success;
-        raises ``JWTError`` on any validation failure.
-        """
-        body = {"token": token}
-        if audience:
-            body["audience"] = audience
-        if allowed_issuer:
-            body["allowed_issuer"] = allowed_issuer
-        resp = _call("POST", "jwt/verify", body)
-        if not isinstance(resp, dict):
-            raise JWTError("internal_error")
-        if not resp.get("valid"):
-            raise JWTError(resp.get("reason") or "internal_error")
-        return resp.get("claims") or {}
-
-    def slice_id(self):
-        """Return the slice's auto-set issuer string."""
-        resp = _call("GET", "jwt/slice-id")
-        if isinstance(resp, dict):
-            return resp.get("slice_id", "")
-        return ""
-
-
-jwt = _JWTNS()
-
-
 def run_ws(handler):
     """Entry point for WebSocket functions.
 
@@ -861,7 +811,7 @@ SQL = sql
 
 
 # ---------------------------------------------------------------------------
-# Realtime / KeyAuth / Vault — backbone primitives (parity with the Go SDK)
+# Realtime — backbone primitive (parity with the Go SDK)
 # ---------------------------------------------------------------------------
 
 class _RealtimeChannel:
@@ -885,48 +835,9 @@ class _RealtimeNS:
         return _RealtimeChannel(name)
 
 
-class _KeyAuthNS:
-    """Passwordless Ed25519 device-key auth. uid = the public key. challenge
-    mints a one-time nonce; the client signs the canonical {domain,nonce,pubkey};
-    verify checks the signature and returns this slice's session JWT."""
-
-    def challenge(self, pubkey):
-        resp = _call("POST", "keyauth/challenge", {"pubkey": pubkey})
-        return resp.get("nonce", "") if isinstance(resp, dict) else ""
-
-    def verify(self, pubkey, sig, domain):
-        resp = _call("POST", "keyauth/verify", {"pubkey": pubkey, "sig": sig, "domain": domain})
-        return resp.get("token", "") if isinstance(resp, dict) else ""
-
-
-class _VaultNS:
-    """Zero-knowledge recovery store: user-scoped, append-only, opaque. The
-    client encrypts the blob under a key the slice never sees. Backed by the
-    `keyvault` NoSQL collection (declare it in your Driftfile)."""
-
-    def put(self, uid, blob):
-        _CollectionHandle("keyvault").insert({
-            "_id": f"{uid}:{time.time_ns()}",
-            "user_id": uid,
-            "blob": blob,
-            "updated_at": int(time.time()),
-        })
-
-    def get(self, uid):
-        rows = _CollectionHandle("keyvault").list({"user_id": uid})
-        best_at, best = -1, None
-        for r in rows:
-            at = r.get("updated_at", 0) if isinstance(r, dict) else 0
-            if at >= best_at:
-                best_at = at
-                best = r.get("blob") if isinstance(r, dict) else None
-        return best
-
-
 # ---------------------------------------------------------------------------
 # Backbone — the B of the sacred A·B·C triad; sole entrypoint for state.
-#   drift.backbone.{secret,cache,nosql,queue,blob,lock,jwt,sql,realtime,
-#                   keyauth,vault}
+#   drift.backbone.{secret,cache,nosql,queue,blob,lock,sql,realtime}
 # ---------------------------------------------------------------------------
 
 class _Backbone:
@@ -936,10 +847,7 @@ class _Backbone:
         self.nosql = _NoSQLNS()
         self.blob = _BlobNS()
         self.lock = _LockNS()
-        self.jwt = _JWTNS()
         self.realtime = _RealtimeNS()
-        self.keyauth = _KeyAuthNS()
-        self.vault = _VaultNS()
 
     def queue(self, name):
         return _QueueHandle(name)
@@ -952,7 +860,375 @@ backbone = _Backbone()
 
 
 # ---------------------------------------------------------------------------
-# Slice-to-slice linking (top-level; seed of a future "D")
+# Deed — identity, verified. The fourth pillar alongside Atomic / Backbone /
+# Canvas — a peer subsystem, not a Backbone primitive, with its own loopback
+# listener (DEED_URL) separate from Backbone's (BACKBONE_URL). See
+# docs/memos/cyberpunk-shit/deed-the-fourth-pillar-drift-identity.md.
+#
+#   drift.deed.{keyauth,jwt,vault,link,pocket}
+#
+# keyauth: passwordless Ed25519 device-key auth. jwt: general-purpose HS256
+# sign/verify (keyauth mints its own tokens through it). vault: an
+# account-key-wrapped keyring. link: multi-device attestation / enrollment /
+# revocation. pocket: E2EE per-identity app data, JWT-gated.
+#
+# Not to be confused with cross-slice calling (drift.slice(name) /
+# caller_slice, further below) — that's inter-slice networking, a different,
+# still-hypothetical future pillar. deed.link enrolls another DEVICE for the
+# same identity; it has nothing to do with calling another SLICE.
+# ---------------------------------------------------------------------------
+
+
+class _KeyAuthNS:
+    """Passwordless Ed25519 device-key auth (Deed.KeyAuth). uid = the public
+    key — no accounts, no passwords, no email. challenge mints a one-time
+    nonce; the client signs the canonical {domain,nonce,pubkey}; verify
+    checks the signature and issues this slice's session JWT (sub = pubkey).
+    The client half (keygen + signing + recovery-phrase derivation) is a
+    small browser library; see the @ondrift/keyauth memo."""
+
+    def challenge(self, pubkey):
+        """Return a one-time login nonce for the given Ed25519 public key
+        (32-byte hex). Single-use, short-TTL, cache-backed in the slice."""
+        resp = _call_deed("POST", "keyauth/challenge", {"pubkey": pubkey})
+        return resp.get("nonce", "") if isinstance(resp, dict) else ""
+
+    def verify(self, pubkey, sig, domain):
+        """Check the client's signature over the canonical
+        {domain,nonce,pubkey} and, on success, return this slice's session
+        JWT (sub = the pubkey). ``domain`` namespaces the signature to your
+        app (e.g. "myapp-auth-v1") so a signature for one app/slice can't be
+        replayed at another — the client must sign the same domain."""
+        resp = _call_deed("POST", "keyauth/verify", {"pubkey": pubkey, "sig": sig, "domain": domain})
+        return resp.get("token", "") if isinstance(resp, dict) else ""
+
+
+class JWTError(Exception):
+    """Raised by deed.jwt.verify on validation failure. ``reason`` is one of
+    the stable wire strings: ``malformed``, ``bad_signature``, ``expired``,
+    ``not_yet_valid``, ``wrong_algorithm``, ``wrong_issuer``,
+    ``wrong_audience``, ``invalid_claims``, ``missing_exp``,
+    ``internal_error``.
+    """
+
+    def __init__(self, reason):
+        super().__init__(f"jwt verify: {reason}")
+        self.reason = reason
+
+
+class _JWTNS:
+    """HS256 JWT minting + verification (Deed.JWT), signed with the slice's
+    per-slice JKey. The signing key never leaves the slice's backbone
+    process; all operations flow through loopback HTTP to
+    backbone /jwt/{sign,verify,slice-id}. General-purpose on its own, but
+    squarely part of Deed — keyauth mints its tokens through it, and pocket
+    verifies them.
+
+    Design: internal/todo/slice-jwt-primitive.md.
+    """
+
+    def issue(
+        self,
+        sub=None,
+        exp=None,
+        iat=None,
+        nbf=None,
+        iss=None,
+        aud=None,
+        jti=None,
+        custom=None,
+    ):
+        """Sign a JWT with the slice's HS256 JKey.
+
+        ``exp`` is required. ``iat``, ``iss``, and ``jti`` are auto-set when
+        unset. ``custom`` is a dict of app-specific claims that the platform
+        never inspects.
+        """
+        body = {}
+        if sub is not None:
+            body["sub"] = sub
+        if exp is not None:
+            body["exp"] = exp
+        if iat is not None:
+            body["iat"] = iat
+        if nbf is not None:
+            body["nbf"] = nbf
+        if iss is not None:
+            body["iss"] = iss
+        if aud is not None:
+            body["aud"] = aud
+        if jti is not None:
+            body["jti"] = jti
+        if custom is not None:
+            body["custom"] = custom
+        resp = _call_deed("POST", "jwt/sign", body)
+        return resp.get("token") if isinstance(resp, dict) else None
+
+    def verify(self, token, audience=None, allowed_issuer=None):
+        """Validate ``token``. Returns the parsed claims dict on success;
+        raises ``JWTError`` on any validation failure.
+        """
+        body = {"token": token}
+        if audience:
+            body["audience"] = audience
+        if allowed_issuer:
+            body["allowed_issuer"] = allowed_issuer
+        resp = _call_deed("POST", "jwt/verify", body)
+        if not isinstance(resp, dict):
+            raise JWTError("internal_error")
+        if not resp.get("valid"):
+            raise JWTError(resp.get("reason") or "internal_error")
+        return resp.get("claims") or {}
+
+    def slice_id(self):
+        """Return the slice's auto-set issuer string."""
+        resp = _call_deed("GET", "jwt/slice-id")
+        if isinstance(resp, dict):
+            return resp.get("slice_id", "")
+        return ""
+
+
+class _VaultNS:
+    """Zero-knowledge recovery store (Deed.Vault): opaque, user-scoped,
+    append-only. The client encrypts the blob under a key derived from its
+    recovery phrase (which the slice NEVER sees), so Drift stores the
+    backup but cannot read it. Scoped to a uid the caller supplies —
+    typically the authenticated keyauth pubkey. Backed by Deed's own
+    dedicated routes: AES-256-GCM at rest (defense in depth only — the blob
+    must already be ciphertext before it arrives, since that's the actual
+    source of Vault's confidentiality guarantee) and a per-item size quota.
+    No Driftfile declaration needed."""
+
+    def put(self, uid, blob):
+        """Append an opaque encrypted backup blob for uid. Append-only (a
+        new version each call); get returns the newest."""
+        _call_deed("POST", "deed/vault/put", {"uid": uid, "blob": blob})
+
+    def get(self, uid):
+        """Return the most recent backup blob for uid. Propagates as an
+        error if uid has never written one (same "not found is an error"
+        convention as secret.get/blob.get)."""
+        resp = _call_deed("GET", f"deed/vault/get?uid={urllib.parse.quote(uid)}")
+        return resp.get("blob") if isinstance(resp, dict) else None
+
+
+class _LinkNS:
+    """Multi-device continuity (Deed.Link): generalizes the
+    enroll/attest/revoke pattern so an identity's KeyAuth session can move
+    to a second, third, ... device. The signature parameters below (sig,
+    attesting_pubkey, etc.) are produced entirely client-side — this SDK
+    only forwards them, the same way keyauth.verify forwards a signature it
+    never computes itself. The one rule the whole design rests on: Deed
+    verifies, it never decides — a device is only ever added on the
+    strength of a signature from a device already active in the identity's
+    registry.
+
+    Not to be confused with cross-slice calling (drift.slice(name) /
+    caller_slice, further below) — this Link enrolls a DEVICE for one
+    identity, it does not call another slice."""
+
+    def begin(self, pubkey):
+        """Start a device-linking session for a not-yet-enrolled device's
+        pubkey (usually carried in a QR code alongside the pubkey). Returns
+        a session id for an already-active device to present to attest."""
+        resp = _call_deed("POST", "deed/link/begin", {"pubkey": pubkey})
+        return resp.get("session_id", "") if isinstance(resp, dict) else ""
+
+    def attest(self, identity, session_id, attesting_pubkey, sig):
+        """Have an already-active device vouch for the session's pending
+        device. ``sig`` is the client's signature over the canonical
+        {domain,identity,new_pubkey} message — computed client-side, never
+        by this SDK."""
+        _call_deed("POST", "deed/link/attest", {
+            "identity": identity,
+            "session_id": session_id,
+            "attesting_pubkey": attesting_pubkey,
+            "sig": sig,
+        })
+
+    def complete(self, session_id):
+        """Poll a session the new device started with begin, returning
+        whether an active device has attested it yet: {"status": ...,
+        "identity": ...}. ``identity`` is only present once ``status`` ==
+        "attested"."""
+        resp = _call_deed("POST", "deed/link/complete", {"session_id": session_id})
+        return resp if isinstance(resp, dict) else {}
+
+    def revoke(self, identity, target_pubkey, revoking_pubkey, sig):
+        """Deactivate ``target_pubkey`` in ``identity``'s device registry.
+        Any currently-active device may revoke another (or itself);
+        ``revoking_pubkey`` is the device doing the revoking, ``sig`` its
+        signature over the canonical {domain,identity,target_pubkey}
+        message."""
+        _call_deed("POST", "deed/link/revoke", {
+            "identity": identity,
+            "target_pubkey": target_pubkey,
+            "revoking_pubkey": revoking_pubkey,
+            "sig": sig,
+        })
+
+
+def _call_deed(method, path, body=None):
+    """Like _call but hits Deed's own listener (DEED_URL) and has no
+    local-dev fallback. deed.vault and deed.link have no in-memory
+    local-dev implementation the way every Backbone primitive does
+    (_call_local has no "deed/..." case), so routing them through plain
+    _call would silently no-op a void-returning call like vault.put or
+    link.attest in local dev — it would report success without ever
+    storing anything, since _call_local returns None for an unmatched
+    path. Requiring DEED_URL here makes that failure honest and
+    immediate instead, matching keyauth/jwt's existing "not available
+    without a running slice" precedent.
+
+    Same connection-reuse + one-shot retry shape as _call, but against
+    Deed's own persistent connection (_ensure_deed_conn) — a separate
+    port from Backbone's.
+    """
+    global _deed_conn
+    base = _get_deed_url()
+    if not base:
+        raise RuntimeError(
+            "drift: deed requires a running slice (DEED_URL) — not available in local dev"
+        )
+
+    data = None
+    headers = {}
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+
+    with _deed_conn_lock:
+        for attempt in range(2):
+            conn, prefix = _ensure_deed_conn(base)
+            try:
+                conn.request(method, f"{prefix}/{path}", body=data, headers=headers)
+                resp = conn.getresponse()
+                raw = resp.read()
+                if 200 <= resp.status < 300:
+                    if not raw:
+                        return None
+                    try:
+                        return json.loads(raw)
+                    except (json.JSONDecodeError, ValueError):
+                        return raw.decode("utf-8", errors="replace")
+                raise urllib.error.HTTPError(
+                    f"{base}/{path}", resp.status, resp.reason or "", resp.getheaders(), None
+                )
+            except (http.client.RemoteDisconnected, ConnectionResetError, BrokenPipeError):
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                _deed_conn = None
+                if attempt == 0:
+                    continue
+                raise
+
+
+def _call_auth(method, path, token, body=None):
+    """Like _call_deed but attaches an Authorization: Bearer header — used
+    by deed.pocket, whose routes are JWT-gated (unlike every other
+    loopback-open Backbone/Deed primitive). Local dev (no DEED_URL) has
+    no JWT verification to check a token against, so — same as
+    keyauth/jwt already — this call isn't available without a running
+    slice.
+
+    Same connection-reuse + one-shot retry shape as _call, against
+    Deed's own persistent connection.
+    """
+    global _deed_conn
+    base = _get_deed_url()
+    if not base:
+        raise RuntimeError(
+            "drift: deed pocket requires a running slice (DEED_URL) — not available in local dev"
+        )
+
+    data = None
+    headers = {"Authorization": f"Bearer {token}"}
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+
+    with _deed_conn_lock:
+        for attempt in range(2):
+            conn, prefix = _ensure_deed_conn(base)
+            try:
+                conn.request(method, f"{prefix}/{path}", body=data, headers=headers)
+                resp = conn.getresponse()
+                raw = resp.read()
+                if 200 <= resp.status < 300:
+                    if not raw:
+                        return None
+                    try:
+                        return json.loads(raw)
+                    except (json.JSONDecodeError, ValueError):
+                        return raw.decode("utf-8", errors="replace")
+                raise urllib.error.HTTPError(
+                    f"{base}/{path}", resp.status, resp.reason or "", resp.getheaders(), None
+                )
+            except (http.client.RemoteDisconnected, ConnectionResetError, BrokenPipeError):
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                _deed_conn = None
+                if attempt == 0:
+                    continue
+                raise
+
+
+class _PocketNS:
+    """An app's actual data (Deed.Pocket) — E2EE, content-keyed, following
+    an identity across every device link has enrolled. The crypto work
+    happens entirely client-side before anything reaches this primitive;
+    Pocket never encrypts or decrypts the payload itself. Every call takes
+    ``token`` explicitly (the JWT keyauth.verify returned) rather than
+    holding hidden session state — matching the rest of this SDK's
+    stateless posture inside an Atomic function invocation. The token's
+    ``sub`` is the only identity a call can read or write under; there is
+    no way to name a different one."""
+
+    def set(self, token, key, blob):
+        """Store blob under key for whichever identity token resolves to."""
+        _call_auth("POST", "deed/pocket/set", token, {"key": key, "blob": blob})
+
+    def get(self, token, key):
+        """Return the blob stored under key for token's identity.
+        Propagates as an error if no such key exists."""
+        resp = _call_auth("GET", f"deed/pocket/get?key={urllib.parse.quote(key)}", token)
+        return resp.get("blob") if isinstance(resp, dict) else None
+
+    def delete(self, token, key):
+        """Remove key for token's identity. Propagates as an error if no
+        such key exists."""
+        _call_auth("POST", "deed/pocket/delete", token, {"key": key})
+
+    def list(self, token):
+        """Return every key stored under token's identity — never another
+        identity's, even by guessing."""
+        resp = _call_auth("GET", "deed/pocket/list", token)
+        return resp if isinstance(resp, list) else []
+
+
+class _Deed:
+    """Deed is the entrypoint for every identity primitive: keyauth, jwt,
+    vault, link, pocket."""
+
+    def __init__(self):
+        self.keyauth = _KeyAuthNS()
+        self.jwt = _JWTNS()
+        self.vault = _VaultNS()
+        self.link = _LinkNS()
+        self.pocket = _PocketNS()
+
+
+deed = _Deed()
+
+
+# ---------------------------------------------------------------------------
+# Slice-to-slice linking (top-level; inter-slice networking — unrelated to
+# deed.link, which enrolls DEVICES for one identity rather than calling
+# another slice)
 # ---------------------------------------------------------------------------
 
 def _link_env_name(name):
@@ -1010,4 +1286,4 @@ def env(key):
 
 # The sacred triad is the SOLE entrypoint for state primitives — remove the
 # top-level names so everything stateful goes through drift.backbone.
-del secret, cache, nosql, blob, lock, jwt, queue, sql, SQL
+del secret, cache, nosql, blob, lock, queue, sql, SQL
