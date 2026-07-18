@@ -1027,30 +1027,64 @@ class _LinkNS:
     caller_slice, further below) — this Link enrolls a DEVICE for one
     identity, it does not call another slice."""
 
-    def begin(self, pubkey):
+    def begin(self, pubkey, metadata=None):
         """Start a device-linking session for a not-yet-enrolled device's
         pubkey (usually carried in a QR code alongside the pubkey). Returns
-        a session id for an already-active device to present to attest."""
-        resp = _call_deed("POST", "deed/link/begin", {"pubkey": pubkey})
+        a session id for an already-active device to present to attest.
+
+        ``metadata`` is an optional opaque string an attesting device can
+        read back via ``session_info`` — e.g. an ephemeral key it should
+        seal a payload for. Deed never interprets it."""
+        body = {"pubkey": pubkey}
+        if metadata is not None:
+            body["metadata"] = metadata
+        resp = _call_deed("POST", "deed/link/begin", body)
         return resp.get("session_id", "") if isinstance(resp, dict) else ""
 
-    def attest(self, identity, session_id, attesting_pubkey, sig):
+    def session_info(self, session_id):
+        """A read-only, repeatable peek at a pending session — what an
+        attesting device (which only ever learns ``session_id``, from a
+        scanned/typed code) uses to learn ``new_pubkey`` (``attest``'s
+        message is verified server-side against the session's own stored
+        value, never the request body, so the attester has to reconstruct
+        it exactly) and whatever opaque metadata the joining device passed
+        to ``begin``. Returns {"new_pubkey": ..., "metadata": ...}."""
+        resp = _call_deed("POST", "deed/link/session", {"session_id": session_id})
+        return resp if isinstance(resp, dict) else {}
+
+    def qr(self, text):
+        """Render ``text`` (in practice, a Link session id) as a scannable
+        QR code, returning inline SVG markup. Pure rendering — no session
+        or identity involvement, so it works for any short string."""
+        resp = _call_deed("POST", "deed/link/qr", {"text": text})
+        return resp.get("svg", "") if isinstance(resp, dict) else ""
+
+    def attest(self, identity, session_id, attesting_pubkey, sig, sealed=None):
         """Have an already-active device vouch for the session's pending
         device. ``sig`` is the client's signature over the canonical
         {domain,identity,new_pubkey} message — computed client-side, never
-        by this SDK."""
-        _call_deed("POST", "deed/link/attest", {
+        by this SDK.
+
+        ``sealed`` is an optional opaque string relayed back once
+        ``complete`` reports "attested" — e.g. a payload end-to-end-
+        encrypted for whatever key the joiner published as ``begin``'s
+        metadata. Deed only relays it, never opens it."""
+        body = {
             "identity": identity,
             "session_id": session_id,
             "attesting_pubkey": attesting_pubkey,
             "sig": sig,
-        })
+        }
+        if sealed is not None:
+            body["sealed"] = sealed
+        _call_deed("POST", "deed/link/attest", body)
 
     def complete(self, session_id):
         """Poll a session the new device started with begin, returning
         whether an active device has attested it yet: {"status": ...,
-        "identity": ...}. ``identity`` is only present once ``status`` ==
-        "attested"."""
+        "identity": ..., "sealed": ...}. ``identity``/``sealed`` are only
+        present once ``status`` == "attested" (``sealed`` only if
+        ``attest`` supplied one)."""
         resp = _call_deed("POST", "deed/link/complete", {"session_id": session_id})
         return resp if isinstance(resp, dict) else {}
 

@@ -1119,12 +1119,21 @@ pub mod deed {
     pub mod link {
         use super::{request, malformed, DeedError};
 
-        /// Returned by [`complete`]. `identity` is set only once
-        /// `status == "attested"`.
+        /// Returned by [`complete`]. `identity`/`sealed` are set only once
+        /// `status == "attested"` (`sealed` only if `attest_with_seal`
+        /// supplied one).
         #[derive(Debug, Clone, Default)]
         pub struct LinkStatus {
             pub status: String,
             pub identity: Option<String>,
+            pub sealed: Option<String>,
+        }
+
+        /// Returned by [`session_info`].
+        #[derive(Debug, Clone, Default)]
+        pub struct LinkSessionInfo {
+            pub new_pubkey: String,
+            pub metadata: Option<String>,
         }
 
         /// Starts a device-linking session for a not-yet-enrolled device's
@@ -1137,6 +1146,57 @@ pub mod deed {
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string())
                 .ok_or_else(|| malformed("deed/link/begin"))
+        }
+
+        /// Same as [`begin`], but also registers an opaque `metadata`
+        /// string an attesting device can read back via `session_info` —
+        /// e.g. an ephemeral key it should seal a payload for. Deed never
+        /// interprets it. A separate function rather than an added
+        /// parameter to `begin`, since Rust has no default arguments and
+        /// changing `begin`'s arity would break every existing caller.
+        pub fn begin_with_metadata(pubkey: &str, metadata: &str) -> Result<String, DeedError> {
+            let resp = request(
+                "POST",
+                "deed/link/begin",
+                None,
+                Some(&serde_json::json!({"pubkey": pubkey, "metadata": metadata})),
+            )?;
+            resp.get("session_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .ok_or_else(|| malformed("deed/link/begin"))
+        }
+
+        /// A read-only, repeatable peek at a pending session — what an
+        /// attesting device (which only ever learns `session_id`, from a
+        /// scanned/typed code) uses to learn `new_pubkey` (`attest`'s
+        /// message is verified server-side against the session's own
+        /// stored value, never the request body, so the attester has to
+        /// reconstruct it exactly) and whatever opaque metadata the
+        /// joining device passed to `begin`.
+        pub fn session_info(session_id: &str) -> Result<LinkSessionInfo, DeedError> {
+            let resp = request(
+                "POST",
+                "deed/link/session",
+                None,
+                Some(&serde_json::json!({"session_id": session_id})),
+            )?;
+            Ok(LinkSessionInfo {
+                new_pubkey: resp.get("new_pubkey").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                metadata: resp.get("metadata").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            })
+        }
+
+        /// Renders `text` (in practice, a Link session ID) as a scannable
+        /// QR code, returning inline SVG markup. Pure rendering — no
+        /// session or identity involvement, so it works for any short
+        /// string.
+        pub fn qr(text: &str) -> Result<String, DeedError> {
+            let resp = request("POST", "deed/link/qr", None, Some(&serde_json::json!({"text": text})))?;
+            resp.get("svg")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .ok_or_else(|| malformed("deed/link/qr"))
         }
 
         /// Has an already-active device vouch for the session's pending
@@ -1158,6 +1218,28 @@ pub mod deed {
             Ok(())
         }
 
+        /// Same as [`attest`], but also carries an opaque `sealed` string
+        /// relayed back once [`complete`] reports "attested" — e.g. a
+        /// payload end-to-end-encrypted for whatever key the joiner
+        /// published as `begin_with_metadata`'s metadata. Deed only relays
+        /// it, never opens it. A separate function for the same arity
+        /// reason as `begin_with_metadata`.
+        pub fn attest_with_seal(identity: &str, session_id: &str, attesting_pubkey: &str, sig: &str, sealed: &str) -> Result<(), DeedError> {
+            request(
+                "POST",
+                "deed/link/attest",
+                None,
+                Some(&serde_json::json!({
+                    "identity": identity,
+                    "session_id": session_id,
+                    "attesting_pubkey": attesting_pubkey,
+                    "sig": sig,
+                    "sealed": sealed,
+                })),
+            )?;
+            Ok(())
+        }
+
         /// Polls a session the new device started with `begin`, returning
         /// whether an active device has attested it yet.
         pub fn complete(session_id: &str) -> Result<LinkStatus, DeedError> {
@@ -1165,6 +1247,7 @@ pub mod deed {
             Ok(LinkStatus {
                 status: resp.get("status").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
                 identity: resp.get("identity").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                sealed: resp.get("sealed").and_then(|v| v.as_str()).map(|s| s.to_string()),
             })
         }
 

@@ -904,8 +904,18 @@ func (vaultNS) Get(uid string) (json.RawMessage, error) {
 // Begin starts a device-linking session for a not-yet-enrolled device's
 // pubkey (usually carried in a QR code alongside the pubkey). Returns a
 // session ID for an already-active device to present to Attest.
-func (linkNS) Begin(pubkey string) (string, error) {
-	resp, err := callDeed("POST", "deed/link/begin", map[string]any{"pubkey": pubkey})
+//
+// metadata is an optional opaque string (Go has no default arguments, so
+// this is variadic — Begin(pubkey) still works unchanged; pass one extra
+// string to set it) an attesting device can retrieve via SessionInfo —
+// e.g. an ephemeral key it should seal a payload for. Deed never
+// interprets it.
+func (linkNS) Begin(pubkey string, metadata ...string) (string, error) {
+	body := map[string]any{"pubkey": pubkey}
+	if len(metadata) > 0 {
+		body["metadata"] = metadata[0]
+	}
+	resp, err := callDeed("POST", "deed/link/begin", body)
 	if err != nil {
 		return "", err
 	}
@@ -918,23 +928,73 @@ func (linkNS) Begin(pubkey string) (string, error) {
 	return out.SessionID, nil
 }
 
+// LinkSessionInfo is returned by Link.SessionInfo.
+type LinkSessionInfo struct {
+	NewPubkey string `json:"new_pubkey"`
+	Metadata  string `json:"metadata,omitempty"`
+}
+
+// SessionInfo is a read-only, repeatable peek at a pending session an
+// attesting device uses after scanning/typing a session ID: NewPubkey is
+// required to reconstruct the message Attest signs (the server verifies
+// against its own stored value, never the request body), Metadata is
+// whatever the joining device passed to Begin.
+func (linkNS) SessionInfo(sessionID string) (LinkSessionInfo, error) {
+	resp, err := callDeed("POST", "deed/link/session", map[string]any{"session_id": sessionID})
+	if err != nil {
+		return LinkSessionInfo{}, err
+	}
+	var out LinkSessionInfo
+	if err := json.Unmarshal(resp, &out); err != nil {
+		return LinkSessionInfo{}, err
+	}
+	return out, nil
+}
+
+// QR renders text (in practice, a Link session ID) as a scannable QR code,
+// returning inline SVG markup. Pure rendering — no session or identity
+// involvement, so it works for any short string, not just Link sessions.
+func (linkNS) QR(text string) (string, error) {
+	resp, err := callDeed("POST", "deed/link/qr", map[string]any{"text": text})
+	if err != nil {
+		return "", err
+	}
+	var out struct {
+		SVG string `json:"svg"`
+	}
+	if err := json.Unmarshal(resp, &out); err != nil {
+		return "", err
+	}
+	return out.SVG, nil
+}
+
 // Attest has an already-active device vouch for the session's pending
 // device. sig is the client's signature over the canonical
 // {domain,identity,new_pubkey} message — computed client-side, never by
 // this SDK.
-func (linkNS) Attest(identity, sessionID, attestingPubkey, sig string) error {
-	_, err := callDeed("POST", "deed/link/attest", map[string]any{
+//
+// sealed is an optional opaque string (variadic for the same reason as
+// Begin's metadata) relayed back once Complete reports "attested" — e.g.
+// a payload end-to-end-encrypted for whatever key the joiner published as
+// Begin's metadata. Deed only relays it, never opens it.
+func (linkNS) Attest(identity, sessionID, attestingPubkey, sig string, sealed ...string) error {
+	body := map[string]any{
 		"identity": identity, "session_id": sessionID,
 		"attesting_pubkey": attestingPubkey, "sig": sig,
-	})
+	}
+	if len(sealed) > 0 {
+		body["sealed"] = sealed[0]
+	}
+	_, err := callDeed("POST", "deed/link/attest", body)
 	return err
 }
 
-// LinkStatus is returned by Link.Complete. Identity is set only once
-// Status == "attested".
+// LinkStatus is returned by Link.Complete. Identity and Sealed are set
+// only once Status == "attested" (Sealed only if Attest supplied one).
 type LinkStatus struct {
 	Status   string `json:"status"`
 	Identity string `json:"identity,omitempty"`
+	Sealed   string `json:"sealed,omitempty"`
 }
 
 // Complete polls a session the new device started with Begin, returning

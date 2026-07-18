@@ -1034,10 +1034,40 @@ class Link {
      * Start a device-linking session for a not-yet-enrolled device's
      * pubkey (usually carried in a QR code alongside the pubkey). Returns
      * a session ID for an already-active device to present to attest().
+     *
+     * $metadata is an optional opaque string an attesting device can read
+     * back via session_info() — e.g. an ephemeral key it should seal a
+     * payload for. Deed never interprets it.
      */
-    public static function begin(string $pubkey): string {
-        $resp = _call_deed('POST', 'deed/link/begin', ['pubkey' => $pubkey]);
+    public static function begin(string $pubkey, ?string $metadata = null): string {
+        $body = ['pubkey' => $pubkey];
+        if ($metadata !== null) $body['metadata'] = $metadata;
+        $resp = _call_deed('POST', 'deed/link/begin', $body);
         return is_array($resp) ? (string)($resp['session_id'] ?? '') : '';
+    }
+
+    /**
+     * A read-only, repeatable peek at a pending session — what an
+     * attesting device (which only ever learns $session_id, from a
+     * scanned/typed code) uses to learn new_pubkey (attest()'s message is
+     * verified server-side against the session's own stored value, never
+     * the request body, so the attester has to reconstruct it exactly)
+     * and whatever opaque metadata the joining device passed to begin().
+     * Result: ['new_pubkey' => ..., 'metadata' => ...].
+     */
+    public static function session_info(string $session_id): array {
+        $resp = _call_deed('POST', 'deed/link/session', ['session_id' => $session_id]);
+        return is_array($resp) ? $resp : ['new_pubkey' => '', 'metadata' => ''];
+    }
+
+    /**
+     * Render $text (in practice, a Link session ID) as a scannable QR
+     * code, returning inline SVG markup. Pure rendering — no session or
+     * identity involvement, so it works for any short string.
+     */
+    public static function qr(string $text): string {
+        $resp = _call_deed('POST', 'deed/link/qr', ['text' => $text]);
+        return is_array($resp) ? (string)($resp['svg'] ?? '') : '';
     }
 
     /**
@@ -1045,21 +1075,29 @@ class Link {
      * device. $sig is the client's signature over the canonical
      * {domain,identity,new_pubkey} message — computed client-side, never
      * by this SDK.
+     *
+     * $sealed is an optional opaque string relayed back once complete()
+     * reports 'attested' — e.g. a payload end-to-end-encrypted for
+     * whatever key the joiner published as begin()'s metadata. Deed only
+     * relays it, never opens it.
      */
-    public static function attest(string $identity, string $session_id, string $attesting_pubkey, string $sig): void {
-        _call_deed('POST', 'deed/link/attest', [
+    public static function attest(string $identity, string $session_id, string $attesting_pubkey, string $sig, ?string $sealed = null): void {
+        $body = [
             'identity'         => $identity,
             'session_id'       => $session_id,
             'attesting_pubkey' => $attesting_pubkey,
             'sig'              => $sig,
-        ]);
+        ];
+        if ($sealed !== null) $body['sealed'] = $sealed;
+        _call_deed('POST', 'deed/link/attest', $body);
     }
 
     /**
      * Poll a session the new device started with begin(), returning
      * whether an active device has attested it yet. Result:
-     * ['status' => ..., 'identity' => ...] — identity is set only once
-     * status === 'attested'.
+     * ['status' => ..., 'identity' => ..., 'sealed' => ...] — identity/
+     * sealed are set only once status === 'attested' (sealed only if
+     * attest() supplied one).
      */
     public static function complete(string $session_id): array {
         $resp = _call_deed('POST', 'deed/link/complete', ['session_id' => $session_id]);

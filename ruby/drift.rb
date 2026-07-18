@@ -707,26 +707,60 @@ module Drift
       # compiles fine as a plain method name given an explicit receiver
       # (it's a reserved word only in expression position); Drift::SqlDb#begin
       # elsewhere in this file is the same precedent already in production.
-      def self.begin(pubkey)
-        resp = Drift._call_deed('POST', 'deed/link/begin', { 'pubkey' => pubkey })
+      #
+      # metadata is an optional opaque string an attesting device can read
+      # back via session_info -- e.g. an ephemeral key it should seal a
+      # payload for. Deed never interprets it.
+      def self.begin(pubkey, metadata: nil)
+        body = { 'pubkey' => pubkey }
+        body['metadata'] = metadata unless metadata.nil?
+        resp = Drift._call_deed('POST', 'deed/link/begin', body)
         resp.is_a?(Hash) ? (resp['session_id'] || '') : ''
+      end
+
+      # A read-only, repeatable peek at a pending session -- what an
+      # attesting device (which only ever learns session_id, from a
+      # scanned/typed code) uses to learn new_pubkey (attest's message is
+      # verified server-side against the session's own stored value, never
+      # the request body, so the attester has to reconstruct it exactly)
+      # and whatever opaque metadata the joining device passed to begin.
+      # Returns { 'new_pubkey' => ..., 'metadata' => ... }.
+      def self.session_info(session_id)
+        resp = Drift._call_deed('POST', 'deed/link/session', { 'session_id' => session_id })
+        resp.is_a?(Hash) ? resp : {}
+      end
+
+      # Render text (in practice, a Link session ID) as a scannable QR
+      # code, returning inline SVG markup. Pure rendering -- no session or
+      # identity involvement, so it works for any short string.
+      def self.qr(text)
+        resp = Drift._call_deed('POST', 'deed/link/qr', { 'text' => text })
+        resp.is_a?(Hash) ? (resp['svg'] || '') : ''
       end
 
       # Have an already-active device vouch for the session's pending
       # device. `sig` is the client's signature over the canonical
       # {domain,identity,new_pubkey} message -- computed client-side, never
       # by this SDK.
-      def self.attest(identity, session_id, attesting_pubkey, sig)
-        Drift._call_deed('POST', 'deed/link/attest', {
+      #
+      # sealed is an optional opaque string relayed back once complete
+      # reports "attested" -- e.g. a payload end-to-end-encrypted for
+      # whatever key the joiner published as begin's metadata. Deed only
+      # relays it, never opens it.
+      def self.attest(identity, session_id, attesting_pubkey, sig, sealed: nil)
+        body = {
           'identity' => identity, 'session_id' => session_id,
           'attesting_pubkey' => attesting_pubkey, 'sig' => sig,
-        })
+        }
+        body['sealed'] = sealed unless sealed.nil?
+        Drift._call_deed('POST', 'deed/link/attest', body)
       end
 
       # Poll a session the new device started with begin, returning whether
       # an active device has attested it yet:
-      # { 'status' => ..., 'identity' => ... } -- 'identity' is only set
-      # once status == "attested".
+      # { 'status' => ..., 'identity' => ..., 'sealed' => ... } --
+      # 'identity'/'sealed' are only set once status == "attested" ('sealed'
+      # only if attest supplied one).
       def self.complete(session_id)
         resp = Drift._call_deed('POST', 'deed/link/complete', { 'session_id' => session_id })
         resp.is_a?(Hash) ? resp : {}

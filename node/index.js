@@ -975,26 +975,61 @@ const link = {
    * Starts a device-linking session for a not-yet-enrolled device's pubkey
    * (usually carried in a QR code alongside the pubkey). Returns a session ID
    * for an already-active device to present to attest.
+   *
+   * opts.metadata is an optional opaque string an attesting device can read
+   * back via link.sessionInfo — e.g. an ephemeral key it should seal a
+   * payload for. Deed never interprets it.
    */
-  begin: async (pubkey) => {
-    const resp = await _callChecked("POST", "deed/link/begin", { pubkey });
+  begin: async (pubkey, opts = {}) => {
+    const body = { pubkey };
+    if (opts.metadata) body.metadata = opts.metadata;
+    const resp = await _callChecked("POST", "deed/link/begin", body);
     return (resp && resp.session_id) || "";
+  },
+
+  /**
+   * A read-only, repeatable peek at a pending session — what an attesting
+   * device (which only ever learns sessionId, from a scanned/typed code)
+   * uses to learn new_pubkey (attest's message is verified server-side
+   * against the session's own stored value, never the request body, so the
+   * attester has to reconstruct it exactly) and whatever opaque metadata
+   * the joining device passed to begin.
+   */
+  sessionInfo: async (sessionId) =>
+    (await _callChecked("POST", "deed/link/session", { session_id: sessionId })) || {},
+
+  /**
+   * Renders text (in practice, a Link session ID) as a scannable QR code,
+   * returning inline SVG markup. Pure rendering — no session or identity
+   * involvement, so it works for any short string.
+   */
+  qr: async (text) => {
+    const resp = await _callChecked("POST", "deed/link/qr", { text });
+    return (resp && resp.svg) || "";
   },
 
   /**
    * Has an already-active device vouch for the session's pending device. sig
    * is the client's signature over the canonical {domain,identity,new_pubkey}
    * message — computed client-side, never by this SDK.
+   *
+   * opts.sealed is an optional opaque string relayed back once complete
+   * reports "attested" — e.g. a payload end-to-end-encrypted for whatever
+   * key the joiner published as begin's metadata. Deed only relays it.
    */
-  attest: (identity, sessionId, attestingPubkey, sig) =>
-    _callChecked("POST", "deed/link/attest", {
+  attest: (identity, sessionId, attestingPubkey, sig, opts = {}) => {
+    const body = {
       identity, session_id: sessionId, attesting_pubkey: attestingPubkey, sig,
-    }),
+    };
+    if (opts.sealed) body.sealed = opts.sealed;
+    return _callChecked("POST", "deed/link/attest", body);
+  },
 
   /**
    * Polls a session the new device started with begin, returning whether an
-   * active device has attested it yet: `{status, identity?}` — identity is
-   * only set once status === "attested".
+   * active device has attested it yet: `{status, identity?, sealed?}` —
+   * identity/sealed are only set once status === "attested" (sealed only if
+   * attest supplied one).
    */
   complete: async (sessionId) =>
     (await _callChecked("POST", "deed/link/complete", { session_id: sessionId })) || {},
